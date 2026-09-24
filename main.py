@@ -18,6 +18,10 @@ from datetime import date, time, timedelta
 # ATTEMPT TO ADD A WAY TO PARSE THREAD NAME TO ADD TO THE LEADER BOARD LAST WORKSHEET DONE, AND MAYBE ADD A LIST OF NOT DONE WORKSHEETS THAT THEY CAN GET DM'D to them if needed
 # streak freeze mechanic
 # improve logging of threads by claim_thread()
+# add phrase of the week = 5 points
+# make non streak increasing submissions also send a message
+# vip questions 5 points
+
 
 # FIX LIST
 # ATTACHING A PHOTO THAT UPDATES THE THREAD DOESNT COUNT AND DOESNT GIVE POINTS
@@ -201,6 +205,36 @@ async def claim_thread(message:discord.Message, tag: str):
         'awarded_at': str(date.today())
     })
 
+async def send_points_message(user, points, activity, sorted_data, show_streak=False):
+    position = 0
+    for index, row in enumerate(sorted_data):
+        if row['id'] == str(user.id):
+            position = index + 1
+            total_points = row['points']
+            streak = row.get('streak', 0)
+            break
+    if position == 0:
+        await log(f"Could not find {user.mention} in the leaderboard after awarding points")
+        return
+
+    embed = discord.Embed(
+        title=f"{activity}!",
+        description=f"Ahlan **{user.display_name}**! Keep up the momentum!",
+        color=0x288fcf
+    )
+    embed.set_thumbnail(url="https://i.ibb.co/BKLCTWv5/4ab2bbcfa5b9a10891406d2a84e94004.webp")
+    if show_streak:
+        embed.add_field(name="🔥 Current Streak", value=f"**{streak}** weeks", inline=True)
+    embed.add_field(name="🪙 Points Earned", value=f"**+{points}**", inline=True)
+    embed.add_field(name="📊 Leaderboard Rank", value=f"**#{position}**", inline=True)
+    embed.add_field(name="🪙 Total Points", value=f"**{total_points}**", inline=True)
+    embed.set_footer(text="Linguazad Community", icon_url="https://i.ibb.co/BKLCTWv5/4ab2bbcfa5b9a10891406d2a84e94004.webp")
+
+    try:
+        await user.send(embed=embed)
+    except discord.Forbidden:
+        await log(f"Could not DM {user.mention} about their points. They might have DMs disabled.")
+
 async def handle_writing(message:discord.Message, user_data: dict, points:int = text_points, emoji:str = text_points_emoji, min_length: int = min_written_length, check_last_sent_time:bool = True, tag:str = None, alone:bool = True):
     """
     This helper function handles messages that qualify for writing points,
@@ -219,7 +253,8 @@ async def handle_writing(message:discord.Message, user_data: dict, points:int = 
                 'last_writing_date': str(date.today())
             })
             await message.add_reaction(emoji)
-            await update_leaderboard()
+            sorted_data = await update_leaderboard()
+            await send_points_message(message.author, points, "📝 Writing Completed", sorted_data)
             if tag:
                 await claim_thread(message, tag)
 
@@ -234,7 +269,8 @@ async def handle_writing(message:discord.Message, user_data: dict, points:int = 
                         'last_writing_date': str(date.today())
                     })
                     await message.add_reaction(emoji)  # adds the text points emoji
-                    await update_leaderboard()
+                    sorted_data = await update_leaderboard()
+                    await send_points_message(message.author, points, "🖼️ Image Submission Completed", sorted_data)
                     if tag:
                         await claim_thread(message, tag)
                     await log(f"Image detected in {message.channel.mention}, points awarded: {points}")
@@ -260,7 +296,8 @@ async def handle_speaking(message:discord.Message, user_data: dict, points:int =
                     'last_speaking_date': str(date.today())
                 })
                 await message.add_reaction(emoji)  # adds the voice points emoji
-                await update_leaderboard()
+                sorted_data = await update_leaderboard()
+                await send_points_message(message.author, points, "🎤 Speaking Completed", sorted_data)
                 if tag:
                     await claim_thread(message, tag)
                 await log(
@@ -302,7 +339,6 @@ async def handle_worksheets(message:discord.Message, user_data: dict, points:int
                 'streak': firestore.Increment(1)
             })
             await message.add_reaction(emoji[effective_streak])
-            await send_worksheet_message(message, user_data)
             await log(
                 f"{message.author.mention} sent a worksheet answer in {message.channel.mention}, points awarded: {effective_points}, streak: increased by 1")
         else:
@@ -315,7 +351,8 @@ async def handle_worksheets(message:discord.Message, user_data: dict, points:int
             await message.add_reaction(emoji[effective_streak])
             await log(
                 f"{message.author.mention} sent a worksheet answer in {message.channel.mention}, points awarded: {effective_points}, streak: not increased because their last one was within 7 days ")
-        await update_leaderboard()
+        sorted_data = await update_leaderboard()
+        await send_points_message(message.author, effective_points, "🎉 Worksheet Completed", sorted_data, show_streak=True)
         if tag:
             await claim_thread(message, tag)
 
@@ -332,7 +369,8 @@ async def handle_dictation(message:discord.Message):
             'points': firestore.Increment(voice_points)
         })
         await message.add_reaction(voice_points_emoji)
-        await update_leaderboard()
+        sorted_data = await update_leaderboard()
+        await send_points_message(message.author, voice_points, "🎧 Voice Dictation Completed", sorted_data)
         await log(
             f"{message.author.mention} sent a voice message in {message.channel.mention} with over {min_dictation_voice_length} seconds of duration, points awarded: {voice_points}")
 
@@ -342,7 +380,8 @@ async def handle_dictation(message:discord.Message):
             'last_writing_date': str(date.today())
         })
         await message.add_reaction(text_points_emoji)
-        await update_leaderboard()
+        sorted_data = await update_leaderboard()
+        await send_points_message(message.author, text_points, "✍️ Written Dictation Completed", sorted_data)
         await log(
             f"{message.author.mention} sent a text message in {message.channel.mention} with over {min_dictation_length} chars, points awarded: {text_points}")
 
@@ -352,63 +391,6 @@ async def handle_message(message:discord.Message, user_data: dict, voice_points:
         return
     await handle_writing(message, user_data, points= text_points, emoji = text_emoji, min_length= min_written_length, alone = False, check_last_sent_time=check_last_sent_time, tag=tag)
     await handle_speaking(message, user_data, points= voice_points, emoji = voice_emoji, min_length= min_speaking_length, alone = False, check_last_sent_time=check_last_sent_time, tag=tag)
-
-async def send_worksheet_message(message:discord.Message, user_data:dict, points:int = worksheet_points):
-    """
-
-    """
-    effective_streak = min(user_data.get('streak'), 4)
-    effective_points = int(points * (1 + effective_streak * weekly_bonuspercent / 100))
-    sorted_data = await update_leaderboard()
-    user_position = 0
-    total_points = user_data.get('points') + effective_points
-    for index, user in enumerate(sorted_data):
-        if user['id'] == str(message.author.id):
-            user_position = index + 1
-            total_points = user['points']
-            break
-    display_position = f"#{user_position}"
-    embed_data = {
-        "title": "🎉 Worksheet Completed!",
-        "description": f"Ahlan **{message.author.display_name}**!\nGreat job this week with the worksheet! Keep up the momentum!",
-        "color": 0x288fcf,
-        "thumbnail": {
-            "url": "https://i.ibb.co/BKLCTWv5/4ab2bbcfa5b9a10891406d2a84e94004.webp"
-        },
-        "fields": [
-            {
-                "name": "🔥 Current Streak",
-                "value": f"**{user_data.get('streak') + 1}** weeks",
-                "inline": True
-            },
-            {
-                "name": "🪙 Points Earned",
-                "value": f"**+{effective_points}**",
-                "inline": True
-            },
-            {
-                "name": "📊 Leaderboard Rank",
-                "value": f"**{display_position}**",
-                "inline": True
-            },
-            {
-                "name": "🪙 Total Points",
-                "value": f"**{total_points}**",
-                "inline": True
-            }
-        ],
-        "footer": {
-            "text": "Linguazad Community",
-            "icon_url": "https://i.ibb.co/BKLCTWv5/4ab2bbcfa5b9a10891406d2a84e94004.webp"
-        }
-    }
-    try:
-        # Convert the dictionary to an embed and send it
-        success_embed = discord.Embed.from_dict(embed_data)
-        await message.author.send(embed=success_embed)
-    except discord.Forbidden:
-        await log(
-            f"Could not DM {message.author.mention} for the streak increase message. They might have DMs disabled.")
 
 @bot.event
 async def on_ready(): # on ready event, essential for the bot, and has the loop checks such as the streaks reset and the monthly and weekly leaderboards
@@ -472,7 +454,7 @@ async def configure(interaction: discord.Interaction, franco_channel: discord.Te
         print(f"Error: {e}")
 
 
-@bot.tree.command(name="leaderboard", description="Tests the leaderboard", guild=get_guild()) #force updates the leaderboard
+@bot.tree.command(name="leaderboard", description="Updates the leaderboard", guild=get_guild()) #force updates the leaderboard
 @discord.app_commands.checks.has_permissions(administrator=True)
 async def leaderboard(interaction: discord.Interaction):
     await update_leaderboard()
@@ -488,7 +470,9 @@ async def add_points(interaction: discord.Interaction, user: discord.User, point
     })
     await interaction.response.send_message(f"{points} points added to {user.mention}", ephemeral=True)
     await log(f"{points} points added to {user.mention}")
-    await update_leaderboard()
+    sorted_data = await update_leaderboard()
+    if points > 0:
+        await send_points_message(user, points, "🪙 Points Added", sorted_data)
 
 
 @bot.tree.command(name="remove_points", description="removes points from a user", guild=get_guild()) #command for removing points
@@ -577,13 +561,13 @@ async def on_message(message):
                 if tag.id == task_forum_ids.get("worksheet"):
                     await handle_worksheets(message, user_data, tag = tag.name)
                 if tag.id == task_forum_ids.get("reactivation"):
-                    await handle_message(message, user_data,check_last_sent_time=False, tag = tag.name)
+                    await handle_message(message, user_data,check_last_sent_time=False, tag = tag.name, voice_points= 20, text_points =20)
                 if tag.id == task_forum_ids.get("vocab"):
-                    await handle_message(message, user_data, check_last_sent_time=False, tag=tag.name)
+                    await handle_message(message, user_data, check_last_sent_time=False, tag=tag.name, voice_points= 20, text_points =20)
                 if tag.id == task_forum_ids.get("retell"):
-                    await handle_message(message, user_data, check_last_sent_time=False, tag=tag.name)
+                    await handle_message(message, user_data, check_last_sent_time=False, tag=tag.name, voice_points= 20, text_points =20)
                 if tag.id == task_forum_ids.get("connect"):
-                    await handle_message(message, user_data,check_last_sent_time=False, tag = tag.name)
+                    await handle_message(message, user_data,check_last_sent_time=False, tag = tag.name, voice_points= 20, text_points =20)
 
     if message.channel.id == config['dictation_channel_id']:
         await handle_dictation(message)
@@ -592,15 +576,15 @@ async def on_message(message):
 
 # Monthly Leaderboard Handling
 @tasks.loop(time = time(hour = 0, minute = 0, second = 0))
-#@bot.tree.command(name="monthly_leaderboard", description="Tests the monthly leaderboard", guild=get_guild())
 async def monthly_leaderboard():
     if date.today().day != 1:
         return
+    previous_month = date.today().replace(day=1) - timedelta(days=1)
     user_data = db.collection('users').get()
     docs = [{ 'id': doc.id, **doc.to_dict()} for doc in user_data]
     sorted_data = sorted(docs, key=lambda x: x['points'], reverse=True)
     channel = bot.get_channel(config["weekly_leaderboard_id"])
-    embed = discord.Embed(title=f"🏆 {date.today().strftime('%B')} Leaderboard", color=discord.Color.gold())
+    embed = discord.Embed(title=f"🏆 {previous_month.strftime('%B %Y')} Leaderboard", color=discord.Color.gold())
     embed.set_thumbnail(url="https://i.ibb.co/BKLCTWv5/4ab2bbcfa5b9a10891406d2a84e94004.webp")
     embed.timestamp = discord.utils.utcnow()
 
@@ -613,14 +597,29 @@ async def monthly_leaderboard():
             inline=False
         )
     await channel.send(embed=embed)
-    winner = await bot.fetch_user(int(sorted_data[0]['id']))
-    await channel.send(f"🎉 Congratulations {winner.mention}! You won this month! Please open a ticket or message us on WhatsApp.")
+
+    winners:list = []
+    for user in sorted_data[:3]:
+        winner = await channel.guild.fetch_member(int(user['id']))
+        winners.append(winner)
+
+    winner_roles:list = [1552510875720745021, 1552510908335525918, 1552510967290667048]
+
+    await channel.send(f"Congratulations to our winners!"
+                       f"\n🥇 25-min private class with Sara {winners[0].mention}"
+                       f"\n🥈 Speaking Club group class {winners[1].mention}"
+                       f"\n🥉 Choose an upcoming story topic/or video reactivation topic {winners[2].mention}"
+                       f"\n Message Sara for your Prize 🎖️🤩")
+    for index, winner in enumerate(winners):
+        role = channel.guild.get_role(winner_roles[index])
+        await winner.add_roles(role)
+
     all_users = db.collection('users').get()
     for user in all_users:
         db.collection('users').document(user.id).update({'points': 0})
-    # await interaction.response.send_message("test", ephemeral=True)
-    await log(f"Monthly leaderboard for {date.today().strftime('%B')} sent, and all the points are reset! ")
+    await log(f"Monthly leaderboard for {previous_month.strftime('%B %Y')} sent, and all the points are reset! ")
     await update_leaderboard()
+
 # Weekly Leaderboard Handling
 @tasks.loop(time= time(hour = 0, minute = 0, second = 0))
 #@bot.tree.command(name="weekly_leaderboard", description="Tests the weekly leaderboard", guild=get_guild())
