@@ -20,7 +20,6 @@ from datetime import date, time, timedelta
 # improve logging of threads by claim_thread()
 # add phrase of the week = 5 points
 # make non streak increasing submissions also send a message
-# vip questions 5 points
 
 
 # FIX LIST
@@ -53,8 +52,10 @@ bot = commands.Bot(command_prefix='.', intents=intents)
 text_points = 10
 voice_points = 15
 worksheet_points = 20
+vip_question_points = 5
 text_points_emoji = "<:Linguazad_10:1495031679772004425>"
 voice_points_emoji = "<:Linguazad_15:1495031741633794212>"
+vip_question_emoji = "<:Linguazad_5:1552531992053289041>"
 worksheet_points_emojis = {0: "<:Linguazad_20:1495031721329037384>",
                            1: "<:Linguazad_22:1495036190259150990>",
                            2: "<:Linguazad_24:1495036411018215536>",
@@ -85,6 +86,7 @@ def load_config(): #function for loading the config, used to create local var co
         "franco_channel_id": None,
         "speaking_channel_id" : None,
         "dictation_channel_id" : None,
+        "vip_questions_channel_id": None,
         "task_forum_id" : None,
         "leaderboard_channel_id": None,
         "leaderboard_message_id": None,
@@ -205,6 +207,16 @@ async def claim_thread(message:discord.Message, tag: str):
         'awarded_at': str(date.today())
     })
 
+def update_task_streak(message, user_data):
+    if is_thread_claimed(message.channel.id):
+        return
+    # Existing date fields now track all task forum submissions.
+    changes = {'last_worksheet_date': str(date.today())}
+    if missed_last_week(user_data.get('first_worksheet_thisWeek_date')):
+        changes['first_worksheet_thisWeek_date'] = str(date.today())
+        changes['streak'] = firestore.Increment(1)
+    db.collection('users').document(str(message.author.id)).update(changes)
+
 async def send_points_message(user, points, activity, sorted_data, show_streak=False):
     position = 0
     for index, row in enumerate(sorted_data):
@@ -252,9 +264,12 @@ async def handle_writing(message:discord.Message, user_data: dict, points:int = 
                 'points': firestore.Increment(points),
                 'last_writing_date': str(date.today())
             })
+            if tag:
+                update_task_streak(message, user_data)
             await message.add_reaction(emoji)
             sorted_data = await update_leaderboard()
-            await send_points_message(message.author, points, "📝 Writing Completed", sorted_data)
+            activity = f"🎉 {tag.title()} Completed" if tag else "📝 Writing Completed"
+            await send_points_message(message.author, points, activity, sorted_data, show_streak=bool(tag))
             if tag:
                 await claim_thread(message, tag)
 
@@ -268,9 +283,12 @@ async def handle_writing(message:discord.Message, user_data: dict, points:int = 
                         'points': firestore.Increment(points),
                         'last_writing_date': str(date.today())
                     })
+                    if tag:
+                        update_task_streak(message, user_data)
                     await message.add_reaction(emoji)  # adds the text points emoji
                     sorted_data = await update_leaderboard()
-                    await send_points_message(message.author, points, "🖼️ Image Submission Completed", sorted_data)
+                    activity = f"🎉 {tag.title()} Completed" if tag else "🖼️ Image Submission Completed"
+                    await send_points_message(message.author, points, activity, sorted_data, show_streak=bool(tag))
                     if tag:
                         await claim_thread(message, tag)
                     await log(f"Image detected in {message.channel.mention}, points awarded: {points}")
@@ -295,9 +313,12 @@ async def handle_speaking(message:discord.Message, user_data: dict, points:int =
                     'points': firestore.Increment(points),
                     'last_speaking_date': str(date.today())
                 })
+                if tag:
+                    update_task_streak(message, user_data)
                 await message.add_reaction(emoji)  # adds the voice points emoji
                 sorted_data = await update_leaderboard()
-                await send_points_message(message.author, points, "🎤 Speaking Completed", sorted_data)
+                activity = f"🎉 {tag.title()} Completed" if tag else "🎤 Speaking Completed"
+                await send_points_message(message.author, points, activity, sorted_data, show_streak=bool(tag))
                 if tag:
                     await claim_thread(message, tag)
                 await log(
@@ -385,6 +406,13 @@ async def handle_dictation(message:discord.Message):
         await log(
             f"{message.author.mention} sent a text message in {message.channel.mention} with over {min_dictation_length} chars, points awarded: {text_points}")
 
+async def handle_vip_question(message:discord.Message):
+    db.collection('users').document(str(message.author.id)).update({
+        'points': firestore.Increment(vip_question_points)
+    })
+    await message.add_reaction(vip_question_emoji)
+    await update_leaderboard()
+
 async def handle_message(message:discord.Message, user_data: dict, voice_points:int = voice_points, text_points:int = text_points, voice_emoji:str = voice_points_emoji, text_emoji:str = text_points_emoji, min_speaking_length: int =min_speaking_length, min_length:int = min_written_length, check_last_sent_time: bool = True, tag:str = None):
     if tag and is_thread_claimed(message.channel.id):
         await log(f"Follow up message sent in {message.channel.mention} by {message.author.mention}")
@@ -437,14 +465,14 @@ async def cfg(interaction):
 @bot.tree.command(name="configure", description="sets the admins and the channels", guild=get_guild()) # sets the settings document in the config collection in the DB
 @discord.app_commands.checks.has_permissions(administrator=True)
 async def configure(interaction: discord.Interaction, franco_channel: discord.TextChannel, arabic_channel: discord.TextChannel, speaking_channel : discord.TextChannel,
-                    dictation_channel :discord.TextChannel, task_forum :discord.ForumChannel,leaderboard_channel: discord.TextChannel, weekly_leaderboard_channel: discord.TextChannel,
+                    dictation_channel :discord.TextChannel, vip_questions_channel: discord.TextChannel, task_forum :discord.ForumChannel,leaderboard_channel: discord.TextChannel, weekly_leaderboard_channel: discord.TextChannel,
                     log_channel: discord.TextChannel, admin1: discord.Member, admin2: discord.Member):
     if config.get("server_id") is None:
         await interaction.response.send_message("Please set the server ID first by typing .setserver", ephemeral = True)
         return
     try:
         db.collection('config').document('settings').set({'franco_channel_id' : str(franco_channel.id), 'arabic_channel_id' : str(arabic_channel.id), "speaking_channel_id" : str(speaking_channel.id)
-                                                             , "dictation_channel_id" : str(dictation_channel.id),"task_forum_id": str(task_forum.id),
+                                                             , "dictation_channel_id" : str(dictation_channel.id), 'vip_questions_channel_id': str(vip_questions_channel.id), "task_forum_id": str(task_forum.id),
                                                            'leaderboard_channel_id' : str(leaderboard_channel.id), 'weekly_leaderboard_id':str(weekly_leaderboard_channel.id),
                                                           'log_channel_id' : str(log_channel.id), 'admin1' : str(admin1.id), 'admin2' : str(admin2.id)},merge=True)
         config.update(load_config())
@@ -516,7 +544,8 @@ async def reset_date(interaction: discord.Interaction, user: discord.Member, dat
 async def on_message(message):
     if message.author == bot.user:
         return
-    if isinstance(message.channel, discord.Thread) and message.channel.parent_id != config.get("task_forum_id"): #prevents it from reading messages in threads that are not in the task answers forum
+    is_task_thread = isinstance(message.channel, discord.Thread) and message.channel.parent_id == config.get("task_forum_id")
+    if isinstance(message.channel, discord.Thread) and not is_task_thread: #prevents it from reading messages in threads that are not in the task answers forum
         return
 
     # Check if the message is in a tracked channel
@@ -525,9 +554,9 @@ async def on_message(message):
         config.get("arabic_channel_id"),
         config.get("speaking_channel_id"),
         config.get("dictation_channel_id"),
-
+        config.get("vip_questions_channel_id"),
     ]
-    if (message.channel.id not in tracked_channels) and not (message.channel.parent_id == config.get("task_forum_id")):
+    if (message.channel.id not in tracked_channels) and not is_task_thread:
         await bot.process_commands(message)
         return
 
@@ -548,8 +577,11 @@ async def on_message(message):
     if message.channel.id == config["speaking_channel_id"] and message.attachments:
         await handle_speaking(message, user_data)
 
-    if message.channel.parent_id == config.get("task_forum_id"):
+    if is_task_thread:
         if message.channel.applied_tags:
+            streak = min(user_data.get('streak', 0), 4)
+            task_points = int(worksheet_points * (1 + streak * weekly_bonuspercent / 100))
+            task_emoji = worksheet_points_emojis[streak]
             in_tags = False
             for tag in message.channel.applied_tags:
                 if tag.id in task_forum_ids.values():
@@ -561,16 +593,19 @@ async def on_message(message):
                 if tag.id == task_forum_ids.get("worksheet"):
                     await handle_worksheets(message, user_data, tag = tag.name)
                 if tag.id == task_forum_ids.get("reactivation"):
-                    await handle_message(message, user_data,check_last_sent_time=False, tag = tag.name, voice_points= 20, text_points =20)
+                    await handle_message(message, user_data,check_last_sent_time=False, tag = tag.name, voice_points=task_points, text_points=task_points, voice_emoji=task_emoji, text_emoji=task_emoji)
                 if tag.id == task_forum_ids.get("vocab"):
-                    await handle_message(message, user_data, check_last_sent_time=False, tag=tag.name, voice_points= 20, text_points =20)
+                    await handle_message(message, user_data, check_last_sent_time=False, tag=tag.name, voice_points=task_points, text_points=task_points, voice_emoji=task_emoji, text_emoji=task_emoji)
                 if tag.id == task_forum_ids.get("retell"):
-                    await handle_message(message, user_data, check_last_sent_time=False, tag=tag.name, voice_points= 20, text_points =20)
+                    await handle_message(message, user_data, check_last_sent_time=False, tag=tag.name, voice_points=task_points, text_points=task_points, voice_emoji=task_emoji, text_emoji=task_emoji)
                 if tag.id == task_forum_ids.get("connect"):
-                    await handle_message(message, user_data,check_last_sent_time=False, tag = tag.name, voice_points= 20, text_points =20)
+                    await handle_message(message, user_data,check_last_sent_time=False, tag = tag.name, voice_points=task_points, text_points=task_points, voice_emoji=task_emoji, text_emoji=task_emoji)
 
     if message.channel.id == config['dictation_channel_id']:
         await handle_dictation(message)
+
+    if message.channel.id == config['vip_questions_channel_id']:
+        await handle_vip_question(message)
 
     await bot.process_commands(message) #crucial so the bot can process written commands like .setserver
 
@@ -660,8 +695,8 @@ async def check_streaks():
             await log(f"Reset streak for <@{user.id}>, their streak was {streak}")
             if member:
                 try:
-                    await member.send(f"Hey, sorry to say, but your worksheet streak of {streak} has been reset, please don't let this discourage you! you can start fresh whenever you have the time!"
-                                  f"\nif you are having trouble with the worksheet and need some help, you can ask <@{config['admin1']}> or <@{config['admin2']}> for help at any time!")
+                    await member.send(f"Hey, sorry to say, but your task streak of {streak} has been reset. You can start fresh with any task forum activity!"
+                                      f"\nIf you need help, you can ask <@{config['admin1']}> or <@{config['admin2']}> at any time!")
                 except discord.Forbidden:
                     await log(f"Could not sent streak reset message for {member.mention}, because they have their DMs closed")
             else:
@@ -671,11 +706,11 @@ async def check_streaks():
             date_until_reset = (record_date + timedelta(days=7)).isoformat()
             if member:
                 if days_from_last == 7:
-                    msg = f"Hi, just wanted to remind you that today is your last day to keep your streak of {streak} alive, do a worksheet now to keep it going! \nYour streak expiry date is: {date_until_reset}"
+                    msg = f"Hi, just wanted to remind you that today is your last day to keep your streak of {streak} alive. Complete a task forum activity to keep it going! \nYour streak expiry date is: {date_until_reset}"
                 elif days_from_last == 6:
-                    msg = f"Hello {member.mention}! I just wanted to remind you that your streak is {streak}, please do a worksheet when you can! \nYour streak expiry date is: {date_until_reset}"
+                    msg = f"Hello {member.mention}! Your streak is {streak}. Complete a task forum activity when you can! \nYour streak expiry date is: {date_until_reset}"
                 else:
-                    msg = f"Hey, just a reminder that your streak of {streak} is going strong! Do a worksheet in the next 2 days to keep it alive! \nYour streak expiry date is: {date_until_reset}"
+                    msg = f"Hey, just a reminder that your streak of {streak} is going strong! Complete a task forum activity in the next 2 days to keep it alive! \nYour streak expiry date is: {date_until_reset}"
                 try:
                     await member.send(msg)
                 except discord.Forbidden:
