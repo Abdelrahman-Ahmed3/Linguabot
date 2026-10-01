@@ -11,7 +11,7 @@ import json
 import webserver
 import firebase_admin
 from firebase_admin import credentials, firestore
-from datetime import date, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 
 # TO DO LIST
 # HELP COMMAND
@@ -27,6 +27,16 @@ from datetime import date, time, timedelta
 
 # Loads the discord token and the firebase creds
 load_dotenv()
+environment = os.getenv("BOT_ENV", "dev")
+if environment not in ("dev", "prod"):
+    raise ValueError("BOT_ENV must be dev or prod")
+
+# Keep existing collections for tests; production gets its own collections.
+prefix = "prod_" if environment == "prod" else ""
+users_collection = prefix + "users"
+config_collection = prefix + "config"
+threads_collection = prefix + "thread_submissions"
+
 token = os.getenv("DISCORD_TOKEN")
 firebase_creds_string = os.getenv("FIREBASE_CREDS")
 if not all([token, firebase_creds_string]):
@@ -53,20 +63,6 @@ text_points = 10
 voice_points = 15
 worksheet_points = 20
 vip_question_points = 5
-text_points_emoji = "<:Linguazad_10:1495031679772004425>"
-voice_points_emoji = "<:Linguazad_15:1495031741633794212>"
-vip_question_emoji = "<:Linguazad_5:1552531992053289041>"
-worksheet_points_emojis = {0: "<:Linguazad_20:1495031721329037384>",
-                           1: "<:Linguazad_22:1495036190259150990>",
-                           2: "<:Linguazad_24:1495036411018215536>",
-                           3: "<:Linguazad_26:1495036335235272764>",
-                           4: "<:Linguazad_28:1495036282521518290>"}
-task_forum_ids = {"worksheet": 1495429343915016406,
-                  "reactivation": 1495429369777098863,
-                  "vocab": 1495429419920134184,
-                  "retell": 1525353590900920440,
-                  "connect": 1525353606599934073
-                  }
 weekly_bonuspercent = 10
 min_worksheet_length = 100
 min_dictation_length = 10
@@ -76,9 +72,13 @@ min_speaking_length = 5
 
 # Functions Section
 
-def load_config(): #function for loading the config, used to create local var config
-    config = {} #create an empty config dict
-    default_config = { #fallback config if there is an empty key/whole db is empty
+def today():
+    # Use GMT (UTC+0) for all activity dates, regardless of the host timezone.
+    return datetime.now(timezone.utc).date()
+
+def load_config():
+    # These settings are individual Discord IDs; the new settings below use other types.
+    default_config = {
         "server_id" : None,
         "admin1" : None,
         "admin2" : None,
@@ -93,29 +93,47 @@ def load_config(): #function for loading the config, used to create local var co
         "weekly_leaderboard_id": None,
         "log_channel_id" : None
     }
-    raw_config = db.collection('config').document('settings').get()
-    if raw_config.exists: #ensures that the config exists, then converts the snapshot to a dict
-        data = raw_config.to_dict()
-        for key in default_config.keys(): #convers the server id to int, and in the future any extra id
-            if data.get(key) is not None: #.get not [key] to prevent crashing
-                config[key] = int(data[key])
-            else:  #if not found, set the key from the default config to the db, and load from local the default config for the key
-                db.collection('config').document('settings').set({key:default_config[key]}, merge=True)
-                config[key] = default_config[key]
-        print("Config loaded successfully")
-    else: #if the document doesn't exist, create it using the default config
-        print(f"Failed to load config, loading default config")
-        db.collection('config').document('settings').set(default_config)
-        config = default_config.copy()
+    raw_config = db.collection(config_collection).document('settings').get()
+    if not raw_config.exists:
+        raise ValueError(f"Missing {config_collection}/settings. Run setup_environments.py first.")
+
+    config = raw_config.to_dict()
+    for key in default_config:
+        config[key] = int(config[key]) if config.get(key) is not None else None
+
+    required_settings = (
+        "text_points_emoji", "voice_points_emoji", "vip_question_emoji",
+        "worksheet_points_emojis", "task_forum_ids", "winner_roles"
+    )
+    for key in required_settings:
+        if not config.get(key):
+            raise ValueError(f"Missing {key} in {config_collection}/settings. Run setup_environments.py first.")
+
+    if not isinstance(config["worksheet_points_emojis"], list) or len(config["worksheet_points_emojis"]) != 5:
+        raise ValueError("worksheet_points_emojis must be a list of five emojis, ordered from 20 to 28 points")
+    if not isinstance(config["winner_roles"], list) or len(config["winner_roles"]) != 3:
+        raise ValueError("winner_roles must be a list of three role IDs, ordered first, second, third")
+    config["winner_roles"] = [int(role_id) for role_id in config["winner_roles"]]
+    config["task_forum_ids"] = {
+        name: int(config["task_forum_ids"][name])
+        for name in ("worksheet", "reactivation", "vocab", "retell", "connect")
+    }
+    print(f"Config loaded for {environment}")
     return config
 
 config = load_config()
+text_points_emoji = config["text_points_emoji"]
+voice_points_emoji = config["voice_points_emoji"]
+vip_question_emoji = config["vip_question_emoji"]
+worksheet_points_emojis = config["worksheet_points_emojis"]
+task_forum_ids = config["task_forum_ids"]
+winner_roles = config["winner_roles"]
 
 async def check_user(message): #it checks that the message author is not the bot, or one of the admins, if not, it returns the user data as a dict
     if message.author == bot.user or message.author.id == config["admin1"] or message.author.id == config["admin2"]:
         return None
 
-    doc_ref = db.collection('users').document(f'{str(message.author.id)}')
+    doc_ref = db.collection(users_collection).document(f'{str(message.author.id)}')
     doc = doc_ref.get()
 
     default_user = {
@@ -144,7 +162,7 @@ async def check_user(message): #it checks that the message author is not the bot
 
 
 async def update_leaderboard(): #function to update the leaderboard, returns sorted data
-    user_data = db.collection('users').get()
+    user_data = db.collection(users_collection).get()
     docs = [{ 'id': doc.id, **doc.to_dict()} for doc in user_data] # added the discord ID (name of the document) to the user_data dict
     sorted_data = sorted(docs, key=lambda x: x['points'], reverse=True) #sorts the data by points, reverse to get descending order
     channel = bot.get_channel(config["leaderboard_channel_id"])
@@ -166,16 +184,16 @@ async def update_leaderboard(): #function to update the leaderboard, returns sor
         except discord.NotFound: #if the message id isn't found (incorrect), it will send it again
             msg = await channel.send(embed=embed)
             config['leaderboard_message_id'] = msg.id
-            db.collection('config').document('settings').set({'leaderboard_message_id': str(msg.id)}, merge=True)
+            db.collection(config_collection).document('settings').set({'leaderboard_message_id': str(msg.id)}, merge=True)
     else: #sends a new message incase there wasn't an old one on setup or if it was deleted
         msg = await channel.send(embed=embed)
         config['leaderboard_message_id'] = msg.id
-        db.collection('config').document('settings').set({'leaderboard_message_id': str(msg.id)}, merge=True)
+        db.collection(config_collection).document('settings').set({'leaderboard_message_id': str(msg.id)}, merge=True)
     return sorted_data
 
 def missed_last_week(date_str): #function to check if 7 days have passed from the input date
     record_date = date.fromisoformat(date_str)
-    return (date.today() - record_date).days > 7
+    return (today() - record_date).days > 7
 
 def get_guild(): #function to the get the guild ID, used in slash commands to sync quickly
     serverID =config.get("server_id")
@@ -196,26 +214,26 @@ async def log(msg):
 # Points Helper Functions Section
 
 def is_thread_claimed(channel_id: int) -> bool:
-    return db.collection('thread_submissions').document(str(channel_id)).get().exists
+    return db.collection(threads_collection).document(str(channel_id)).get().exists
 
 async def claim_thread(message:discord.Message, tag: str):
-    db.collection('thread_submissions').document(str(message.channel.id)).set({
+    db.collection(threads_collection).document(str(message.channel.id)).set({
         'channel_name': message.channel.name,
         'user_id': message.author.id,
         'user_name': message.author.name,
         'tag': tag,
-        'awarded_at': str(date.today())
+        'awarded_at': str(today())
     })
 
 def update_task_streak(message, user_data):
     if is_thread_claimed(message.channel.id):
         return
     # Existing date fields now track all task forum submissions.
-    changes = {'last_worksheet_date': str(date.today())}
+    changes = {'last_worksheet_date': str(today())}
     if missed_last_week(user_data.get('first_worksheet_thisWeek_date')):
-        changes['first_worksheet_thisWeek_date'] = str(date.today())
+        changes['first_worksheet_thisWeek_date'] = str(today())
         changes['streak'] = firestore.Increment(1)
-    db.collection('users').document(str(message.author.id)).update(changes)
+    db.collection(users_collection).document(str(message.author.id)).update(changes)
 
 async def send_points_message(user, points, activity, sorted_data, show_streak=False):
     position = 0
@@ -258,12 +276,12 @@ async def handle_writing(message:discord.Message, user_data: dict, points:int = 
         await log(f"Follow up message sent in {message.channel.mention} by {message.author.mention}")
         return
 
-    if user_data.get('last_writing_date') != str(date.today()) or not check_last_sent_time:
+    if user_data.get('last_writing_date') != str(today()) or not check_last_sent_time:
         if len(message.content) >= min_length:
-            db.collection('users').document(str(message.author.id)).update({
-                'points': firestore.Increment(points),
-                'last_writing_date': str(date.today())
-            })
+            changes = {'points': firestore.Increment(points)}
+            if not tag:
+                changes['last_writing_date'] = str(today())
+            db.collection(users_collection).document(str(message.author.id)).update(changes)
             if tag:
                 update_task_streak(message, user_data)
             await message.add_reaction(emoji)
@@ -279,10 +297,10 @@ async def handle_writing(message:discord.Message, user_data: dict, points:int = 
         elif message.attachments:
             for attachment in message.attachments:
                 if attachment.content_type and attachment.content_type.startswith("image"):
-                    db.collection('users').document(str(message.author.id)).update({
-                        'points': firestore.Increment(points),
-                        'last_writing_date': str(date.today())
-                    })
+                    changes = {'points': firestore.Increment(points)}
+                    if not tag:
+                        changes['last_writing_date'] = str(today())
+                    db.collection(users_collection).document(str(message.author.id)).update(changes)
                     if tag:
                         update_task_streak(message, user_data)
                     await message.add_reaction(emoji)  # adds the text points emoji
@@ -306,13 +324,13 @@ async def handle_speaking(message:discord.Message, user_data: dict, points:int =
         await log(f"Follow up message sent in {message.channel.mention} by {message.author.mention}")
         return
 
-    if user_data.get('last_speaking_date') != str(date.today()) or not check_last_sent_time:
+    if user_data.get('last_speaking_date') != str(today()) or not check_last_sent_time:
         for attachment in message.attachments:
             if attachment.is_voice_message() and attachment.duration >= min_length:  # checks if the user sent a voicenote, and if it is over 5 seconds
-                db.collection('users').document(str(message.author.id)).update({
-                    'points': firestore.Increment(points),
-                    'last_speaking_date': str(date.today())
-                })
+                changes = {'points': firestore.Increment(points)}
+                if not tag:
+                    changes['last_speaking_date'] = str(today())
+                db.collection(users_collection).document(str(message.author.id)).update(changes)
                 if tag:
                     update_task_streak(message, user_data)
                 await message.add_reaction(emoji)  # adds the voice points emoji
@@ -331,7 +349,7 @@ async def handle_speaking(message:discord.Message, user_data: dict, points:int =
         await log(
             f"{message.author.mention} sent a message in {message.channel.mention}, but they already sent one today, points awarded: Zero")
 
-async def handle_worksheets(message:discord.Message, user_data: dict, points:int = worksheet_points, emoji:dict = None, tag:str = None):
+async def handle_worksheets(message:discord.Message, user_data: dict, points:int = worksheet_points, emoji:list = None, tag:str = None):
     """
 
     """
@@ -353,10 +371,10 @@ async def handle_worksheets(message:discord.Message, user_data: dict, points:int
         effective_points = int(points * (1 + effective_streak * weekly_bonuspercent / 100))
         if missed_last_week(first_date):
             # new window, streak +1
-            db.collection('users').document(str(message.author.id)).update({
+            db.collection(users_collection).document(str(message.author.id)).update({
                 'points': firestore.Increment(effective_points),
-                'last_worksheet_date': str(date.today()),
-                'first_worksheet_thisWeek_date': str(date.today()),
+                'last_worksheet_date': str(today()),
+                'first_worksheet_thisWeek_date': str(today()),
                 'streak': firestore.Increment(1)
             })
             await message.add_reaction(emoji[effective_streak])
@@ -364,9 +382,9 @@ async def handle_worksheets(message:discord.Message, user_data: dict, points:int
                 f"{message.author.mention} sent a worksheet answer in {message.channel.mention}, points awarded: {effective_points}, streak: increased by 1")
         else:
             # within window, points with streak bonus but no streak increment
-            db.collection('users').document(str(message.author.id)).update({
+            db.collection(users_collection).document(str(message.author.id)).update({
                 'points': firestore.Increment(effective_points),
-                'last_worksheet_date': str(date.today()),
+                'last_worksheet_date': str(today()),
             })
 
             await message.add_reaction(emoji[effective_streak])
@@ -386,7 +404,7 @@ async def handle_dictation(message:discord.Message):
     """
     if message.attachments and message.attachments[0].is_voice_message() and message.attachments[
         0].duration >= min_dictation_voice_length:
-        db.collection('users').document(str(message.author.id)).update({
+        db.collection(users_collection).document(str(message.author.id)).update({
             'points': firestore.Increment(voice_points)
         })
         await message.add_reaction(voice_points_emoji)
@@ -396,9 +414,9 @@ async def handle_dictation(message:discord.Message):
             f"{message.author.mention} sent a voice message in {message.channel.mention} with over {min_dictation_voice_length} seconds of duration, points awarded: {voice_points}")
 
     if len(message.content) >= min_dictation_length:
-        db.collection('users').document(str(message.author.id)).update({
+        db.collection(users_collection).document(str(message.author.id)).update({
             'points': firestore.Increment(text_points),
-            'last_writing_date': str(date.today())
+            'last_writing_date': str(today())
         })
         await message.add_reaction(text_points_emoji)
         sorted_data = await update_leaderboard()
@@ -407,7 +425,7 @@ async def handle_dictation(message:discord.Message):
             f"{message.author.mention} sent a text message in {message.channel.mention} with over {min_dictation_length} chars, points awarded: {text_points}")
 
 async def handle_vip_question(message:discord.Message):
-    db.collection('users').document(str(message.author.id)).update({
+    db.collection(users_collection).document(str(message.author.id)).update({
         'points': firestore.Increment(vip_question_points)
     })
     await message.add_reaction(vip_question_emoji)
@@ -419,6 +437,20 @@ async def handle_message(message:discord.Message, user_data: dict, voice_points:
         return
     await handle_writing(message, user_data, points= text_points, emoji = text_emoji, min_length= min_written_length, alone = False, check_last_sent_time=check_last_sent_time, tag=tag)
     await handle_speaking(message, user_data, points= voice_points, emoji = voice_emoji, min_length= min_speaking_length, alone = False, check_last_sent_time=check_last_sent_time, tag=tag)
+
+def start_background_tasks():
+    # A fresh environment needs .setserver and /configure before reminders and rankings.
+    required_settings = ("server_id", "leaderboard_channel_id", "weekly_leaderboard_id", "admin1", "admin2")
+    if not all(config.get(key) for key in required_settings):
+        print("Background tasks are waiting for .setserver and /configure.")
+        return
+    if not monthly_leaderboard.is_running():
+        monthly_leaderboard.start()
+    if not weekly_leaderboard.is_running():
+        weekly_leaderboard.start()
+    if not check_streaks.is_running():
+        check_streaks.start()
+
 
 @bot.event
 async def on_ready(): # on ready event, essential for the bot, and has the loop checks such as the streaks reset and the monthly and weekly leaderboards
@@ -432,9 +464,7 @@ async def on_ready(): # on ready event, essential for the bot, and has the loop 
             print(f"Error: {e}")
     else:
         print("Server ID not set, run .setserver to set the ID")
-    monthly_leaderboard.start()
-    weekly_leaderboard.start()
-    check_streaks.start()
+    start_background_tasks()
 
 # Commands Section
 
@@ -443,7 +473,7 @@ async def on_ready(): # on ready event, essential for the bot, and has the loop 
 async def setserver(ctx):
     try:
         server_id = str(ctx.guild.id)
-        config_ref = db.collection('config').document('settings')
+        config_ref = db.collection(config_collection).document('settings')
         config_ref.set({'server_id': server_id}, merge=True)
         config["server_id"] = int(server_id)
         await ctx.author.send(f"✅ Server has been set. Commands will now sync to **{ctx.guild.name}**.")
@@ -457,7 +487,7 @@ async def setserver(ctx):
 @discord.app_commands.checks.has_permissions(administrator=True)
 async def cfg(interaction):
     try:
-        config_data = db.collection('config').document('settings').get().to_dict()
+        config_data = db.collection(config_collection).document('settings').get().to_dict()
         await interaction.response.send_message(config_data, ephemeral=True)
     except Exception as e:
         print(f"Error: {e}")
@@ -471,12 +501,13 @@ async def configure(interaction: discord.Interaction, franco_channel: discord.Te
         await interaction.response.send_message("Please set the server ID first by typing .setserver", ephemeral = True)
         return
     try:
-        db.collection('config').document('settings').set({'franco_channel_id' : str(franco_channel.id), 'arabic_channel_id' : str(arabic_channel.id), "speaking_channel_id" : str(speaking_channel.id)
+        db.collection(config_collection).document('settings').set({'franco_channel_id' : str(franco_channel.id), 'arabic_channel_id' : str(arabic_channel.id), "speaking_channel_id" : str(speaking_channel.id)
                                                              , "dictation_channel_id" : str(dictation_channel.id), 'vip_questions_channel_id': str(vip_questions_channel.id), "task_forum_id": str(task_forum.id),
                                                            'leaderboard_channel_id' : str(leaderboard_channel.id), 'weekly_leaderboard_id':str(weekly_leaderboard_channel.id),
                                                           'log_channel_id' : str(log_channel.id), 'admin1' : str(admin1.id), 'admin2' : str(admin2.id)},merge=True)
         config.update(load_config())
         await interaction.response.send_message("Config updated successfully!", ephemeral = True)
+        start_background_tasks()
         await log(f"Server Settings updated successfully by {interaction.user.mention}")
     except Exception as e:
         print(f"Error: {e}")
@@ -493,7 +524,7 @@ async def leaderboard(interaction: discord.Interaction):
 @bot.tree.command(name="add_points", description="adds points to a user", guild=get_guild()) #command for adding points
 @discord.app_commands.checks.has_permissions(administrator=True)
 async def add_points(interaction: discord.Interaction, user: discord.User, points: int):
-    db.collection('users').document(str(user.id)).update({
+    db.collection(users_collection).document(str(user.id)).update({
         'points': firestore.Increment(points)
     })
     await interaction.response.send_message(f"{points} points added to {user.mention}", ephemeral=True)
@@ -506,7 +537,7 @@ async def add_points(interaction: discord.Interaction, user: discord.User, point
 @bot.tree.command(name="remove_points", description="removes points from a user", guild=get_guild()) #command for removing points
 @discord.app_commands.checks.has_permissions(administrator=True)
 async def remove_points(interaction: discord.Interaction, user: discord.User, points: int):
-    db.collection('users').document(str(user.id)).update({
+    db.collection(users_collection).document(str(user.id)).update({
         'points': firestore.Increment(-points)
     })
     await interaction.response.send_message(f"{points} points removed from {user.mention}", ephemeral=True)
@@ -517,7 +548,7 @@ async def remove_points(interaction: discord.Interaction, user: discord.User, po
 @discord.app_commands.checks.has_permissions(administrator=True)
 async def set_streak(interaction: discord.Interaction, user: discord.Member, streak: int):
     try:
-        db.collection('users').document(f'{str(user.id)}').set({'streak': streak}, merge=True)
+        db.collection(users_collection).document(f'{str(user.id)}').set({'streak': streak}, merge=True)
         await log(f"set streak for {user.mention} to {streak} by {interaction.user.mention}")
         await interaction.response.send_message(f"set streak for {user.mention} to {streak}", ephemeral=True)
         await update_leaderboard()
@@ -534,7 +565,7 @@ async def set_streak(interaction: discord.Interaction, user: discord.Member, str
 ])
 async def reset_date(interaction: discord.Interaction, user: discord.Member, date: Choice[str]):
     date_to_reset = date.value
-    db.collection('users').document(f'{str(user.id)}').set({f'{date_to_reset}': "2000-01-01"}, merge = True)
+    db.collection(users_collection).document(f'{str(user.id)}').set({f'{date_to_reset}': "2000-01-01"}, merge = True)
     await interaction.response.send_message(f"{date.name} was reset for {user.mention}", ephemeral=True)
     await log(f"{date.name} was reset for {user.mention} by {interaction.user.mention}")
 
@@ -610,12 +641,12 @@ async def on_message(message):
     await bot.process_commands(message) #crucial so the bot can process written commands like .setserver
 
 # Monthly Leaderboard Handling
-@tasks.loop(time = time(hour = 0, minute = 0, second = 0))
+@tasks.loop(time = time(hour = 0, minute = 0, second = 0, tzinfo=timezone.utc))
 async def monthly_leaderboard():
-    if date.today().day != 1:
+    if today().day != 1:
         return
-    previous_month = date.today().replace(day=1) - timedelta(days=1)
-    user_data = db.collection('users').get()
+    previous_month = today().replace(day=1) - timedelta(days=1)
+    user_data = db.collection(users_collection).get()
     docs = [{ 'id': doc.id, **doc.to_dict()} for doc in user_data]
     sorted_data = sorted(docs, key=lambda x: x['points'], reverse=True)
     channel = bot.get_channel(config["weekly_leaderboard_id"])
@@ -633,35 +664,48 @@ async def monthly_leaderboard():
         )
     await channel.send(embed=embed)
 
-    winners:list = []
-    for user in sorted_data[:3]:
-        winner = await channel.guild.fetch_member(int(user['id']))
-        winners.append(winner)
+    prizes = [
+        "🥇 25-min private class with Sara",
+        "🥈 Speaking Club group class",
+        "🥉 Choose an upcoming story topic/or video reactivation topic"
+    ]
+    top_users = sorted_data[:3]
 
-    winner_roles:list = [1552510875720745021, 1552510908335525918, 1552510967290667048]
+    if top_users:
+        announcement = "Congratulations to our winners!"
+        for index, user in enumerate(top_users):
+            announcement += f"\n{prizes[index]} <@{user['id']}>"
+        announcement += "\n Message Sara for your Prize 🎖️🤩"
+        try:
+            await channel.send(announcement)
+        except discord.HTTPException as e:
+            await log(f"Could not announce monthly winners: {e}")
 
-    await channel.send(f"Congratulations to our winners!"
-                       f"\n🥇 25-min private class with Sara {winners[0].mention}"
-                       f"\n🥈 Speaking Club group class {winners[1].mention}"
-                       f"\n🥉 Choose an upcoming story topic/or video reactivation topic {winners[2].mention}"
-                       f"\n Message Sara for your Prize 🎖️🤩")
-    for index, winner in enumerate(winners):
+    for index, user in enumerate(top_users):
         role = channel.guild.get_role(winner_roles[index])
-        await winner.add_roles(role)
+        if role is None:
+            await log(f"Monthly winner role {winner_roles[index]} was not found")
+            continue
+        try:
+            winner = await channel.guild.fetch_member(int(user['id']))
+            await winner.add_roles(role)
+        except discord.HTTPException as e:
+            # A missing member or failed role assignment must not block the reset.
+            await log(f"Could not assign monthly winner role to <@{user['id']}>: {e}")
 
-    all_users = db.collection('users').get()
+    all_users = db.collection(users_collection).get()
     for user in all_users:
-        db.collection('users').document(user.id).update({'points': 0})
+        db.collection(users_collection).document(user.id).update({'points': 0})
     await log(f"Monthly leaderboard for {previous_month.strftime('%B %Y')} sent, and all the points are reset! ")
     await update_leaderboard()
 
 # Weekly Leaderboard Handling
-@tasks.loop(time= time(hour = 0, minute = 0, second = 0))
+@tasks.loop(time= time(hour = 0, minute = 0, second = 0, tzinfo=timezone.utc))
 #@bot.tree.command(name="weekly_leaderboard", description="Tests the weekly leaderboard", guild=get_guild())
 async def weekly_leaderboard():
-    if date.today().weekday() != 0 or date.today().day == 1:
+    if today().weekday() != 0 or today().day == 1:
         return
-    user_data = db.collection('users').get()
+    user_data = db.collection(users_collection).get()
     docs = [{'id': doc.id, **doc.to_dict()} for doc in user_data]
     sorted_data = sorted(docs, key=lambda x: x['points'], reverse=True)
     channel = bot.get_channel(config["weekly_leaderboard_id"])
@@ -680,18 +724,18 @@ async def weekly_leaderboard():
     await log(f"Weekly Leaderboard sent")
 
 # daily check streaks
-@tasks.loop(time=time(hour=0, minute=0, second=0))
+@tasks.loop(time=time(hour=0, minute=0, second=0, tzinfo=timezone.utc))
 # @bot.tree.command(name="check_streaks", description="checks the streaks and resets if they haven't posted within a week", guild=get_guild())
 async def check_streaks():
-    all_users = db.collection('users').get()
+    all_users = db.collection(users_collection).get()
     for user in all_users:
         user_data = user.to_dict()
         record_date = date.fromisoformat(user_data.get('last_worksheet_date', '2000-01-01'))
-        days_from_last = (date.today() - record_date).days
+        days_from_last = (today() - record_date).days
         streak = user_data.get('streak', 0) #zero in the bracket is the fallback value
         member = bot.get_user(int(user.id))
         if days_from_last > 7 and streak > 0:
-            db.collection('users').document(user.id).update({'streak': 0})
+            db.collection(users_collection).document(user.id).update({'streak': 0})
             await log(f"Reset streak for <@{user.id}>, their streak was {streak}")
             if member:
                 try:
