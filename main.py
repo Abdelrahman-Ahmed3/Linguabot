@@ -95,7 +95,7 @@ def load_config():
     }
     raw_config = db.collection(config_collection).document('settings').get()
     if not raw_config.exists:
-        raise ValueError(f"Missing {config_collection}/settings. Run setup_environments.py first.")
+        raise ValueError(f"Missing {config_collection}/settings. Create the settings document in Firebase.")
 
     config = raw_config.to_dict()
     for key in default_config:
@@ -107,7 +107,7 @@ def load_config():
     )
     for key in required_settings:
         if not config.get(key):
-            raise ValueError(f"Missing {key} in {config_collection}/settings. Run setup_environments.py first.")
+            raise ValueError(f"Missing {key} in {config_collection}/settings. Add this field in Firebase.")
 
     if not isinstance(config["worksheet_points_emojis"], list) or len(config["worksheet_points_emojis"]) != 5:
         raise ValueError("worksheet_points_emojis must be a list of five emojis, ordered from 20 to 28 points")
