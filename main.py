@@ -12,6 +12,7 @@ import webserver
 import firebase_admin
 from firebase_admin import credentials, firestore
 from datetime import date, datetime, time, timedelta, timezone
+from urllib.parse import urlsplit
 
 # TO DO LIST
 # HELP COMMAND
@@ -211,6 +212,35 @@ async def log(msg):
         except Exception as e:
             print(f"Failed to send log to Discord: {e}")
 
+def has_voice_message(message: discord.Message) -> bool:
+    return any(
+        attachment.is_voice_message()
+        for attachment in message.attachments
+    )
+
+async def fetch_submission_message(message_link: str) -> discord.Message:
+    """Fetch the original message without running any commands contained in it."""
+    link = urlsplit(message_link.strip().strip("<>"))
+    parts = link.path.rstrip("/").split("/")
+    discord_hosts = {
+        "discord.com", "www.discord.com", "discordapp.com",
+        "canary.discord.com", "ptb.discord.com",
+    }
+    if link.hostname not in discord_hosts or len(parts) != 5 or parts[1] != "channels":
+        raise ValueError("Use Discord's Copy Message Link option and paste the full message link.")
+
+    if not all(part.isdecimal() for part in parts[2:]):
+        raise ValueError("The link must point to a message in a server.")
+
+    channel_id = int(parts[3])
+    message_id = int(parts[4])
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        channel = await bot.fetch_channel(channel_id)
+    if not isinstance(channel, discord.abc.Messageable):
+        raise ValueError("The link must point to a message in a text channel or forum thread.")
+    return await channel.fetch_message(message_id)
+
 # Points Helper Functions Section
 
 def is_thread_claimed(channel_id: int) -> bool:
@@ -265,7 +295,9 @@ async def send_points_message(user, points, activity, sorted_data, show_streak=F
     except discord.Forbidden:
         await log(f"Could not DM {user.mention} about their points. They might have DMs disabled.")
 
-async def handle_writing(message:discord.Message, user_data: dict, points:int = text_points, emoji:str = text_points_emoji, min_length: int = min_written_length, check_last_sent_time:bool = True, tag:str = None, alone:bool = True):
+async def handle_writing(message:discord.Message, user_data: dict, points:int = text_points, emoji:str = text_points_emoji,
+                         min_length: int = min_written_length, check_last_sent_time:bool = True, tag:str = None, alone:bool = True,
+                         admin_approved:bool = False):
     """
     This helper function handles messages that qualify for writing points,
     it checks that the message is longer than the default minimum length of min_written_length,
@@ -274,25 +306,24 @@ async def handle_writing(message:discord.Message, user_data: dict, points:int = 
 
     if tag and is_thread_claimed(message.channel.id) and alone:
         await log(f"Follow up message sent in {message.channel.mention} by {message.author.mention}")
-        return
+        return 0
 
     if user_data.get('last_writing_date') != str(today()) or not check_last_sent_time:
-        if len(message.content) >= min_length:
+        if len(message.content) >= min_length or admin_approved:
             changes = {'points': firestore.Increment(points)}
             if not tag:
                 changes['last_writing_date'] = str(today())
             db.collection(users_collection).document(str(message.author.id)).update(changes)
             if tag:
                 update_task_streak(message, user_data)
+                await claim_thread(message, tag)
             await message.add_reaction(emoji)
             sorted_data = await update_leaderboard()
             activity = f"🎉 {tag.title()} Completed" if tag else "📝 Writing Completed"
             await send_points_message(message.author, points, activity, sorted_data, show_streak=bool(tag))
-            if tag:
-                await claim_thread(message, tag)
-
             await log(
                 f"Valid Message detected in {message.channel.mention} from {message.author.mention}, points awarded: {points}")
+            return points
 
         elif message.attachments:
             for attachment in message.attachments:
@@ -303,18 +334,20 @@ async def handle_writing(message:discord.Message, user_data: dict, points:int = 
                     db.collection(users_collection).document(str(message.author.id)).update(changes)
                     if tag:
                         update_task_streak(message, user_data)
+                        await claim_thread(message, tag)
                     await message.add_reaction(emoji)  # adds the text points emoji
                     sorted_data = await update_leaderboard()
                     activity = f"🎉 {tag.title()} Completed" if tag else "🖼️ Image Submission Completed"
                     await send_points_message(message.author, points, activity, sorted_data, show_streak=bool(tag))
-                    if tag:
-                        await claim_thread(message, tag)
                     await log(f"Image detected in {message.channel.mention}, points awarded: {points}")
-                    break
+                    return points
     else:
         await log(f"Message Detected in {message.channel.mention} from {message.author.mention}, but they already wrote one today. Points awarded: Zero")
+    return 0
 
-async def handle_speaking(message:discord.Message, user_data: dict, points:int = voice_points, emoji:str = voice_points_emoji, min_length: int =min_speaking_length, check_last_sent_time: bool = True, tag:str = None, alone:bool = True):
+async def handle_speaking(message:discord.Message, user_data: dict, points:int = voice_points, emoji:str = voice_points_emoji,
+                          min_length: int =min_speaking_length, check_last_sent_time: bool = True, tag:str = None, alone:bool = True,
+                          admin_approved:bool = False):
     """
     This helper function handles messages that qualify for voice points,
     it checks that the message is longer than the default minimum length of min_speaking_length,
@@ -322,25 +355,25 @@ async def handle_speaking(message:discord.Message, user_data: dict, points:int =
     """
     if tag and is_thread_claimed(message.channel.id) and alone:
         await log(f"Follow up message sent in {message.channel.mention} by {message.author.mention}")
-        return
+        return 0
 
     if user_data.get('last_speaking_date') != str(today()) or not check_last_sent_time:
         for attachment in message.attachments:
-            if attachment.is_voice_message() and attachment.duration >= min_length:  # checks if the user sent a voicenote, and if it is over 5 seconds
+            if attachment.is_voice_message() and (admin_approved or attachment.duration >= min_length):
                 changes = {'points': firestore.Increment(points)}
                 if not tag:
                     changes['last_speaking_date'] = str(today())
                 db.collection(users_collection).document(str(message.author.id)).update(changes)
                 if tag:
                     update_task_streak(message, user_data)
+                    await claim_thread(message, tag)
                 await message.add_reaction(emoji)  # adds the voice points emoji
                 sorted_data = await update_leaderboard()
                 activity = f"🎉 {tag.title()} Completed" if tag else "🎤 Speaking Completed"
                 await send_points_message(message.author, points, activity, sorted_data, show_streak=bool(tag))
-                if tag:
-                    await claim_thread(message, tag)
                 await log(
                     f"{message.author.mention} sent a voice message in {message.channel.mention}, points awarded: {points}")
+                return points
 
             elif attachment.is_voice_message():
                 await log(
@@ -348,21 +381,30 @@ async def handle_speaking(message:discord.Message, user_data: dict, points:int =
     elif message:
         await log(
             f"{message.author.mention} sent a message in {message.channel.mention}, but they already sent one today, points awarded: Zero")
+    return 0
 
-async def handle_worksheets(message:discord.Message, user_data: dict, points:int = worksheet_points, emoji:list = None, tag:str = None):
+async def handle_worksheets(message:discord.Message, user_data: dict, points:int = worksheet_points, emoji:list = None,
+                            tag:str = None, admin_approved:bool = False):
     """
 
     """
+
+    has_image = any(
+        attachment.content_type
+        and attachment.content_type.startswith("image/")
+        for attachment in message.attachments
+    )
+
     if emoji is None:
         emoji = worksheet_points_emojis
 
     if tag and is_thread_claimed(message.channel.id):
         await log(f"Follow up message sent in {message.channel.mention} by {message.author.mention}")
-        return
+        return 0
 
-    if len(message.content) < min_worksheet_length:
+    if len(message.content) < min_worksheet_length and not has_image and not admin_approved:
         await log(f"{message.author.mention} sent a message in {message.channel.mention}, but it was shorter than {min_worksheet_length}, points awarded: Zero")
-        return
+        return 0
 
     effective_streak = min(user_data.get('streak'), 4)
 
@@ -377,6 +419,8 @@ async def handle_worksheets(message:discord.Message, user_data: dict, points:int
                 'first_worksheet_thisWeek_date': str(today()),
                 'streak': firestore.Increment(1)
             })
+            if tag:
+                await claim_thread(message, tag)
             await message.add_reaction(emoji[effective_streak])
             await log(
                 f"{message.author.mention} sent a worksheet answer in {message.channel.mention}, points awarded: {effective_points}, streak: increased by 1")
@@ -386,43 +430,58 @@ async def handle_worksheets(message:discord.Message, user_data: dict, points:int
                 'points': firestore.Increment(effective_points),
                 'last_worksheet_date': str(today()),
             })
-
+            if tag:
+                await claim_thread(message, tag)
             await message.add_reaction(emoji[effective_streak])
             await log(
                 f"{message.author.mention} sent a worksheet answer in {message.channel.mention}, points awarded: {effective_points}, streak: not increased because their last one was within 7 days ")
         sorted_data = await update_leaderboard()
         await send_points_message(message.author, effective_points, "🎉 Worksheet Completed", sorted_data, show_streak=True)
-        if tag:
-            await claim_thread(message, tag)
+        return effective_points
 
     except Exception as e:
         await log(f"[DEBUG] worksheet block crashed: {e}")
+        raise
 
-async def handle_dictation(message:discord.Message):
+async def handle_dictation(message:discord.Message, admin_approved:bool = False):
     """
 
     """
-    if message.attachments and message.attachments[0].is_voice_message() and message.attachments[
-        0].duration >= min_dictation_voice_length:
+    awarded_points = 0
+    voice_attachment = None
+
+    for attachment in message.attachments:
+        if attachment.is_voice_message():
+            voice_attachment = attachment
+            break
+
+    if voice_attachment and (
+            admin_approved
+            or voice_attachment.duration >= min_dictation_voice_length
+    ):
         db.collection(users_collection).document(str(message.author.id)).update({
             'points': firestore.Increment(voice_points)
         })
+        awarded_points += voice_points
         await message.add_reaction(voice_points_emoji)
         sorted_data = await update_leaderboard()
         await send_points_message(message.author, voice_points, "🎧 Voice Dictation Completed", sorted_data)
         await log(
-            f"{message.author.mention} sent a voice message in {message.channel.mention} with over {min_dictation_voice_length} seconds of duration, points awarded: {voice_points}")
+            f"{message.author.mention} submitted voice dictation in {message.channel.mention}, points awarded: {voice_points}")
 
-    if len(message.content) >= min_dictation_length:
+    if ((len(message.content) >= min_dictation_length or admin_approved)
+            and not (admin_approved and has_voice_message(message))): # Skip writing rewards for admin-approved voice submissions.
         db.collection(users_collection).document(str(message.author.id)).update({
             'points': firestore.Increment(text_points),
             'last_writing_date': str(today())
         })
+        awarded_points += text_points
         await message.add_reaction(text_points_emoji)
         sorted_data = await update_leaderboard()
         await send_points_message(message.author, text_points, "✍️ Written Dictation Completed", sorted_data)
         await log(
-            f"{message.author.mention} sent a text message in {message.channel.mention} with over {min_dictation_length} chars, points awarded: {text_points}")
+            f"{message.author.mention} submitted written dictation in {message.channel.mention}, points awarded: {text_points}")
+    return awarded_points
 
 async def handle_vip_question(message:discord.Message):
     db.collection(users_collection).document(str(message.author.id)).update({
@@ -430,13 +489,63 @@ async def handle_vip_question(message:discord.Message):
     })
     await message.add_reaction(vip_question_emoji)
     await update_leaderboard()
+    return vip_question_points
 
-async def handle_message(message:discord.Message, user_data: dict, voice_points:int = voice_points, text_points:int = text_points, voice_emoji:str = voice_points_emoji, text_emoji:str = text_points_emoji, min_speaking_length: int =min_speaking_length, min_length:int = min_written_length, check_last_sent_time: bool = True, tag:str = None):
+async def handle_message(message:discord.Message, user_data: dict, voice_points:int = voice_points, text_points:int = text_points,
+                         voice_emoji:str = voice_points_emoji, text_emoji:str = text_points_emoji, min_speaking_length: int =min_speaking_length,
+                         min_length:int = min_written_length, check_last_sent_time: bool = True, tag:str = None, admin_approved:bool = False):
     if tag and is_thread_claimed(message.channel.id):
         await log(f"Follow up message sent in {message.channel.mention} by {message.author.mention}")
-        return
-    await handle_writing(message, user_data, points= text_points, emoji = text_emoji, min_length= min_written_length, alone = False, check_last_sent_time=check_last_sent_time, tag=tag)
-    await handle_speaking(message, user_data, points= voice_points, emoji = voice_emoji, min_length= min_speaking_length, alone = False, check_last_sent_time=check_last_sent_time, tag=tag)
+        return 0
+
+    awarded_points = 0
+    if not (admin_approved and has_voice_message(message)): # only skips admin approved and has voice
+        awarded_points += await handle_writing(message, user_data, points=text_points, emoji=text_emoji, min_length=min_length,
+                             alone=False, check_last_sent_time=check_last_sent_time, tag=tag,
+                             admin_approved=admin_approved)
+
+    awarded_points += await handle_speaking(message, user_data, points= voice_points, emoji = voice_emoji, min_length= min_speaking_length,
+                          alone = False, check_last_sent_time=check_last_sent_time, tag=tag, admin_approved = admin_approved)
+    return awarded_points
+
+async def handle_forum_task(message: discord.Message, user_data: dict, admin_approved: bool = False):
+    """Route forum tags and return awarded points; approval keeps thread claims intact."""
+    channel = message.channel
+    if not isinstance(channel, discord.Thread) or channel.parent_id != config.get("task_forum_id"):
+        raise ValueError("For Forum Task, choose a message in the configured task forum.")
+
+    if is_thread_claimed(channel.id):
+        await log(f"Follow up message sent in {channel.mention} by {message.author.mention}")
+        return 0
+
+    streak = min(user_data.get('streak', 0), 4)
+    task_points = int(worksheet_points * (1 + streak * weekly_bonuspercent / 100))
+    task_emoji = worksheet_points_emojis[streak]
+    recognized_tag = False
+
+    for tag in channel.applied_tags:
+        if tag.id not in task_forum_ids.values():
+            continue
+        recognized_tag = True
+        if tag.id == task_forum_ids["worksheet"]:
+            awarded_points = await handle_worksheets(
+                message, user_data, tag=tag.name, admin_approved=admin_approved,
+            )
+        else:
+            awarded_points = await handle_message(
+                message, user_data, check_last_sent_time=False, tag=tag.name,
+                voice_points=task_points, text_points=task_points,
+                voice_emoji=task_emoji, text_emoji=task_emoji,
+                admin_approved=admin_approved,
+            )
+        if awarded_points:
+            return awarded_points
+
+    if not recognized_tag:
+        await log(f"No recognized task tag found in {channel.mention}; post tags: {channel.applied_tags}")
+        if admin_approved:
+            raise ValueError("This forum post needs a configured task tag so I can select its reward.")
+    return 0
 
 def start_background_tasks():
     # A fresh environment needs .setserver and /configure before reminders and rankings.
@@ -569,6 +678,82 @@ async def reset_date(interaction: discord.Interaction, user: discord.Member, dat
     await interaction.response.send_message(f"{date.name} was reset for {user.mention}", ephemeral=True)
     await log(f"{date.name} was reset for {user.mention} by {interaction.user.mention}")
 
+@bot.tree.command(name="award_submission", description="Award the submission of a certain user", guild=get_guild())
+@discord.app_commands.checks.has_permissions(administrator=True)
+@app_commands.choices(task_type=[
+    Choice(name="Forum Task", value="forum_task"),
+    Choice(name="Dictation", value="dictation"),
+    Choice(name=f"Speaking", value="speaking"),
+    Choice(name="Writing", value="writing"),
+    Choice(name=f"VIP Question", value="VIP_question"),
+])
+async def award_submission(interaction: discord.Interaction, message_link: str, task_type: Choice[str]):
+    await interaction.response.defer(ephemeral=True)
+    award_started = False
+    try:
+        message = await fetch_submission_message(message_link)
+        if message.guild is None or interaction.guild is None or message.guild.id != interaction.guild.id:
+            raise ValueError("Choose a message from the server where you ran this command.")
+
+        user_data = await check_user(message)
+        if user_data is None:
+            await interaction.followup.send("This message's author is excluded from points.", ephemeral=True)
+            return
+
+        award_started = True
+        if task_type.value == "forum_task":
+            awarded_points = await handle_forum_task(message, user_data, admin_approved=True)
+            skip_reason = "This forum thread has already been rewarded."
+        elif task_type.value == "dictation":
+            awarded_points = await handle_dictation(message, admin_approved=True)
+            skip_reason = "No dictation reward was awarded."
+        elif task_type.value == "speaking":
+            awarded_points = await handle_speaking(message, user_data, admin_approved=True)
+            skip_reason = (
+                "This user has already received speaking points today."
+                if has_voice_message(message) else "This message contains no Discord voice message."
+            )
+        elif task_type.value == "writing":
+            awarded_points = await handle_writing(message, user_data, admin_approved=True)
+            skip_reason = "This user has already received writing points today."
+        elif task_type.value == "VIP_question":
+            awarded_points = await handle_vip_question(message)
+            skip_reason = "No VIP question reward was awarded."
+        else:
+            raise ValueError("Choose one of the listed task types.")
+
+        if awarded_points:
+            await interaction.followup.send(
+                f"Awarded **{awarded_points}** points to {message.author.mention} "
+                f"for **{task_type.name}**.\n{message.jump_url}",
+                ephemeral=True,
+            )
+            await log(
+                f"{interaction.user.mention} approved {message.jump_url} as {task_type.name}; "
+                f"{message.author.mention} received {awarded_points} points"
+            )
+        else:
+            await interaction.followup.send(f"No points awarded. {skip_reason}", ephemeral=True)
+    except ValueError as e:
+        await interaction.followup.send(str(e), ephemeral=True)
+    except discord.HTTPException as e:
+        await log(f"award_submission Discord error: {e}")
+        if award_started:
+            reply = "Could not finish the reward's Discord updates. Check the user's points before retrying."
+        elif isinstance(e, discord.NotFound):
+            reply = "The message or channel could not be found."
+        elif isinstance(e, discord.Forbidden):
+            reply = "I don't have permission to read that message."
+        else:
+            reply = "Discord could not fetch that message. Please try again later."
+        await interaction.followup.send(reply, ephemeral=True)
+    except Exception as e:
+        await log(f"award_submission error: {e}")
+        reply = "Could not process this submission."
+        if award_started:
+            reply += " Check the user's points before retrying."
+        await interaction.followup.send(reply, ephemeral=True)
+
 
 # Event handling part
 @bot.event
@@ -609,28 +794,7 @@ async def on_message(message):
         await handle_speaking(message, user_data)
 
     if is_task_thread:
-        if message.channel.applied_tags:
-            streak = min(user_data.get('streak', 0), 4)
-            task_points = int(worksheet_points * (1 + streak * weekly_bonuspercent / 100))
-            task_emoji = worksheet_points_emojis[streak]
-            in_tags = False
-            for tag in message.channel.applied_tags:
-                if tag.id in task_forum_ids.values():
-                    in_tags = True
-            if not in_tags:
-                await log(f"{message.author.mention} sent a message in {message.channel.mention}, with a tag that is not in the tags list, the tags of the post are {message.channel.applied_tags}"
-                          f"\nPlease update the bot with the proper tags")
-            for tag in message.channel.applied_tags:
-                if tag.id == task_forum_ids.get("worksheet"):
-                    await handle_worksheets(message, user_data, tag = tag.name)
-                if tag.id == task_forum_ids.get("reactivation"):
-                    await handle_message(message, user_data,check_last_sent_time=False, tag = tag.name, voice_points=task_points, text_points=task_points, voice_emoji=task_emoji, text_emoji=task_emoji)
-                if tag.id == task_forum_ids.get("vocab"):
-                    await handle_message(message, user_data, check_last_sent_time=False, tag=tag.name, voice_points=task_points, text_points=task_points, voice_emoji=task_emoji, text_emoji=task_emoji)
-                if tag.id == task_forum_ids.get("retell"):
-                    await handle_message(message, user_data, check_last_sent_time=False, tag=tag.name, voice_points=task_points, text_points=task_points, voice_emoji=task_emoji, text_emoji=task_emoji)
-                if tag.id == task_forum_ids.get("connect"):
-                    await handle_message(message, user_data,check_last_sent_time=False, tag = tag.name, voice_points=task_points, text_points=task_points, voice_emoji=task_emoji, text_emoji=task_emoji)
+        await handle_forum_task(message, user_data)
 
     if message.channel.id == config['dictation_channel_id']:
         await handle_dictation(message)
