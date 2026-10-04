@@ -18,13 +18,7 @@ from urllib.parse import urlsplit
 # HELP COMMAND
 # ATTEMPT TO ADD A WAY TO PARSE THREAD NAME TO ADD TO THE LEADER BOARD LAST WORKSHEET DONE, AND MAYBE ADD A LIST OF NOT DONE WORKSHEETS THAT THEY CAN GET DM'D to them if needed
 # streak freeze mechanic
-# improve logging of threads by claim_thread()
-# add phrase of the week = 5 points
-# make non streak increasing submissions also send a message
 
-
-# FIX LIST
-# ATTACHING A PHOTO THAT UPDATES THE THREAD DOESNT COUNT AND DOESNT GIVE POINTS
 
 # Loads the discord token and the firebase creds
 load_dotenv()
@@ -70,6 +64,7 @@ min_dictation_length = 10
 min_dictation_voice_length = 3
 min_written_length = 20
 min_speaking_length = 5
+phrase_of_the_week_points = 5
 
 # Functions Section
 
@@ -89,6 +84,7 @@ def load_config():
         "dictation_channel_id" : None,
         "vip_questions_channel_id": None,
         "task_forum_id" : None,
+        "phrase_of_the_week_channel_id": None,
         "leaderboard_channel_id": None,
         "leaderboard_message_id": None,
         "weekly_leaderboard_id": None,
@@ -126,6 +122,7 @@ config = load_config()
 text_points_emoji = config["text_points_emoji"]
 voice_points_emoji = config["voice_points_emoji"]
 vip_question_emoji = config["vip_question_emoji"]
+phrase_of_the_week_emoji = config["vip_question_emoji"] # uses the same 5 point emojis
 worksheet_points_emojis = config["worksheet_points_emojis"]
 task_forum_ids = config["task_forum_ids"]
 winner_roles = config["winner_roles"]
@@ -491,6 +488,15 @@ async def handle_vip_question(message:discord.Message):
     await update_leaderboard()
     return vip_question_points
 
+async def handle_phrase_of_the_week(message:discord.Message):
+    db.collection(users_collection).document(str(message.author.id)).update({
+        'points': firestore.Increment(phrase_of_the_week_points)
+    })
+    await message.add_reaction(phrase_of_the_week_emoji)
+    await update_leaderboard()
+    return phrase_of_the_week_points
+
+
 async def handle_message(message:discord.Message, user_data: dict, voice_points:int = voice_points, text_points:int = text_points,
                          voice_emoji:str = voice_points_emoji, text_emoji:str = text_points_emoji, min_speaking_length: int =min_speaking_length,
                          min_length:int = min_written_length, check_last_sent_time: bool = True, tag:str = None, admin_approved:bool = False):
@@ -604,16 +610,20 @@ async def cfg(interaction):
 @bot.tree.command(name="configure", description="sets the admins and the channels", guild=get_guild()) # sets the settings document in the config collection in the DB
 @discord.app_commands.checks.has_permissions(administrator=True)
 async def configure(interaction: discord.Interaction, franco_channel: discord.TextChannel, arabic_channel: discord.TextChannel, speaking_channel : discord.TextChannel,
-                    dictation_channel :discord.TextChannel, vip_questions_channel: discord.TextChannel, task_forum :discord.ForumChannel,leaderboard_channel: discord.TextChannel, weekly_leaderboard_channel: discord.TextChannel,
+                    dictation_channel :discord.TextChannel, vip_questions_channel: discord.TextChannel,
+                    task_forum :discord.ForumChannel,leaderboard_channel: discord.TextChannel,
+                    weekly_leaderboard_channel: discord.TextChannel, phrase_of_the_week_channel: discord.TextChannel,
                     log_channel: discord.TextChannel, admin1: discord.Member, admin2: discord.Member):
     if config.get("server_id") is None:
         await interaction.response.send_message("Please set the server ID first by typing .setserver", ephemeral = True)
         return
     try:
-        db.collection(config_collection).document('settings').set({'franco_channel_id' : str(franco_channel.id), 'arabic_channel_id' : str(arabic_channel.id), "speaking_channel_id" : str(speaking_channel.id)
-                                                             , "dictation_channel_id" : str(dictation_channel.id), 'vip_questions_channel_id': str(vip_questions_channel.id), "task_forum_id": str(task_forum.id),
-                                                           'leaderboard_channel_id' : str(leaderboard_channel.id), 'weekly_leaderboard_id':str(weekly_leaderboard_channel.id),
-                                                          'log_channel_id' : str(log_channel.id), 'admin1' : str(admin1.id), 'admin2' : str(admin2.id)},merge=True)
+        db.collection(config_collection).document('settings').set({
+            'franco_channel_id' : str(franco_channel.id), 'arabic_channel_id' : str(arabic_channel.id), "speaking_channel_id" : str(speaking_channel.id),
+            "dictation_channel_id" : str(dictation_channel.id), 'vip_questions_channel_id': str(vip_questions_channel.id),
+            "task_forum_id": str(task_forum.id), 'phrase_of_the_week_channel_id':str(phrase_of_the_week_channel.id),
+            'leaderboard_channel_id' : str(leaderboard_channel.id), 'weekly_leaderboard_id':str(weekly_leaderboard_channel.id),
+            'log_channel_id' : str(log_channel.id), 'admin1' : str(admin1.id), 'admin2' : str(admin2.id)},merge=True)
         config.update(load_config())
         await interaction.response.send_message("Config updated successfully!", ephemeral = True)
         start_background_tasks()
@@ -686,6 +696,7 @@ async def reset_date(interaction: discord.Interaction, user: discord.Member, dat
     Choice(name=f"Speaking", value="speaking"),
     Choice(name="Writing", value="writing"),
     Choice(name=f"VIP Question", value="VIP_question"),
+    Choice(name=f"Phrase Of The Week", value="phrase_of_the_week"),
 ])
 async def award_submission(interaction: discord.Interaction, message_link: str, task_type: Choice[str]):
     await interaction.response.defer(ephemeral=True)
@@ -719,6 +730,10 @@ async def award_submission(interaction: discord.Interaction, message_link: str, 
         elif task_type.value == "VIP_question":
             awarded_points = await handle_vip_question(message)
             skip_reason = "No VIP question reward was awarded."
+        elif task_type.value == "phrase_of_the_week":
+            awarded_points = await handle_phrase_of_the_week(message)
+            skip_reason = "No Phrase Of The Week reward was awarded."
+
         else:
             raise ValueError("Choose one of the listed task types.")
 
@@ -771,6 +786,7 @@ async def on_message(message):
         config.get("speaking_channel_id"),
         config.get("dictation_channel_id"),
         config.get("vip_questions_channel_id"),
+        config.get("phrase_of_the_week_channel_id"),
     ]
     if (message.channel.id not in tracked_channels) and not is_task_thread:
         await bot.process_commands(message)
@@ -801,6 +817,9 @@ async def on_message(message):
 
     if message.channel.id == config['vip_questions_channel_id']:
         await handle_vip_question(message)
+
+    if message.channel.id == config['phrase_of_the_week_channel_id']:
+        await handle_phrase_of_the_week(message)
 
     await bot.process_commands(message) #crucial so the bot can process written commands like .setserver
 
