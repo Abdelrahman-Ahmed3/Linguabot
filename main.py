@@ -336,7 +336,7 @@ async def handle_writing(message:discord.Message, user_data: dict, points:int = 
                     sorted_data = await update_leaderboard()
                     activity = f"🎉 {tag.title()} Completed" if tag else "🖼️ Image Submission Completed"
                     await send_points_message(message.author, points, activity, sorted_data, show_streak=bool(tag))
-                    await log(f"Image detected in {message.channel.mention}, points awarded: {points}")
+                    await log(f"Image detected in {message.channel.mention} by {message.author.mention}, points awarded: {points}")
                     return points
     else:
         await log(f"Message Detected in {message.channel.mention} from {message.author.mention}, but they already wrote one today. Points awarded: Zero")
@@ -486,6 +486,7 @@ async def handle_vip_question(message:discord.Message):
     })
     await message.add_reaction(vip_question_emoji)
     await update_leaderboard()
+    await log(f"{message.author.mention} submitted a vip question in {message.channel.mention}, points awarded: {vip_question_points}")
     return vip_question_points
 
 async def handle_phrase_of_the_week(message:discord.Message):
@@ -494,6 +495,7 @@ async def handle_phrase_of_the_week(message:discord.Message):
     })
     await message.add_reaction(phrase_of_the_week_emoji)
     await update_leaderboard()
+    await log(f"{message.author.mention} submitted a message in {message.channel.mention}, points awarded: {phrase_of_the_week_points}")
     return phrase_of_the_week_points
 
 
