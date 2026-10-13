@@ -17,7 +17,6 @@ from urllib.parse import urlsplit
 # TO DO LIST
 # HELP COMMAND
 # ATTEMPT TO ADD A WAY TO PARSE THREAD NAME TO ADD TO THE LEADER BOARD LAST WORKSHEET DONE, AND MAYBE ADD A LIST OF NOT DONE WORKSHEETS THAT THEY CAN GET DM'D to them if needed
-# streak freeze mechanic
 
 
 # Loads the discord token and the firebase creds
@@ -58,6 +57,7 @@ text_points = 10
 voice_points = 15
 worksheet_points = 20
 vip_question_points = 5
+recommendation_points = 5
 weekly_bonuspercent = 10
 min_worksheet_length = 100
 min_dictation_length = 10
@@ -83,6 +83,7 @@ def load_config():
         "speaking_channel_id" : None,
         "dictation_channel_id" : None,
         "vip_questions_channel_id": None,
+        "recommendations_channel_id": None,
         "task_forum_id" : None,
         "phrase_of_the_week_channel_id": None,
         "leaderboard_channel_id": None,
@@ -123,6 +124,7 @@ text_points_emoji = config["text_points_emoji"]
 voice_points_emoji = config["voice_points_emoji"]
 vip_question_emoji = config["vip_question_emoji"]
 phrase_of_the_week_emoji = config["vip_question_emoji"] # uses the same 5 point emojis
+recommendation_emoji = config["vip_question_emoji"]
 worksheet_points_emojis = config["worksheet_points_emojis"]
 task_forum_ids = config["task_forum_ids"]
 winner_roles = config["winner_roles"]
@@ -132,31 +134,39 @@ async def check_user(message): #it checks that the message author is not the bot
         return None
 
     doc_ref = db.collection(users_collection).document(f'{str(message.author.id)}')
-    doc = doc_ref.get()
+    return initialize_user(db.transaction(), doc_ref, today())
 
-    default_user = {
+
+def missing_user_defaults(data):
+    # Only add missing fields; never overwrite somebody's existing points.
+    defaults = {
         'points': 0,
-        'streak': 0,
-        'last_worksheet_date': "2000-01-01",  # Placeholder dates
-        'first_worksheet_thisWeek_date': "2000-01-01",
         'last_writing_date': "2000-01-01",
-        'last_speaking_date': "2000-01-01"
+        'last_speaking_date': "2000-01-01",
     }
+    missing = {}
+    for field, value in defaults.items():
+        if field not in data:
+            missing[field] = value
+    return missing
 
-    if not doc.exists: #writes a new document with default values in case the author wasn't in the db
-        doc_ref.set(default_user)
-        return default_user
-    user_data = doc.to_dict()
-    needs_update = False
 
-    for key, value in default_user.items():
-        if key not in user_data:
-            user_data[key] = value
-            needs_update = True
-    if needs_update:
-        doc_ref.set(user_data, merge=True)
-        await log(f"Healed document {message.author.mention}'s data from missing fields\nDocument ID: {message.author.id}")
-    return user_data
+@firestore.transactional
+def initialize_user(transaction, doc_ref, on_date):
+    snapshot = doc_ref.get(transaction=transaction)
+    data = snapshot.to_dict()
+    if data is None:
+        data = {}
+    fields = missing_user_defaults(data)
+    fields.update(normalize_streak(data, on_date))
+    changes = {}
+    for field, value in fields.items():
+        if field not in data or data[field] != value:
+            changes[field] = value
+    if changes:
+        transaction.set(doc_ref, changes, merge=True)
+    data.update(fields)
+    return data
 
 
 async def update_leaderboard(): #function to update the leaderboard, returns sorted data
@@ -189,9 +199,202 @@ async def update_leaderboard(): #function to update the leaderboard, returns sor
         db.collection(config_collection).document('settings').set({'leaderboard_message_id': str(msg.id)}, merge=True)
     return sorted_data
 
-def missed_last_week(date_str): #function to check if 7 days have passed from the input date
-    record_date = date.fromisoformat(date_str)
-    return (today() - record_date).days > 7
+# Weekly task streaks (UTC personal seven-day periods)
+ANCHOR = "first_worksheet_thisWeek_date"
+LAST_TASK = "last_worksheet_date"
+STREAK_VERSION = 1
+
+
+def empty_streak():
+    return {
+        "streak": 0,
+        ANCHOR: None,
+        LAST_TASK: None,
+        "streak_shields": 0,
+        "streak_last_processed_period": -1,
+        "streak_last_reminder_key": None,
+        "streak_version": STREAK_VERSION,
+    }
+
+
+def read_date(value):
+    if not value or value == "2000-01-01":
+        return None
+    return date.fromisoformat(value)
+
+
+def normalize_streak(data, on_date):
+    """Migrate old records once, retaining their count and latest task date.
+
+    The old moving earning-window date cannot reconstruct a historical anchor.
+    Use the latest task as period zero; normal expiry still applies from that date.
+    """
+    state = empty_streak()
+    if data.get("streak_version") == STREAK_VERSION:
+        for field in state:
+            if field in data:
+                state[field] = data[field]
+    elif data.get("streak_version") is not None:
+        raise ValueError("Unsupported streak data version.")
+    else:
+        count = int(data.get("streak") or 0)
+        if count > 0:
+            last_task_date = read_date(data.get(LAST_TASK))
+            if last_task_date is not None:
+                state['streak'] = count
+                state[ANCHOR] = last_task_date.isoformat()
+                state[LAST_TASK] = last_task_date.isoformat()
+    validate_streak(state, on_date)
+    return state
+
+
+def validate_streak(state, on_date):
+    for field in ("streak", "streak_shields", "streak_last_processed_period"):
+        if type(state[field]) is not int:
+            raise ValueError(f"{field} must be a whole number.")
+    if state["streak"] < 0:
+        raise ValueError("Streak cannot be negative.")
+    if state["streak_shields"] not in (0, 1):
+        raise ValueError("Shields must be 0 or 1.")
+    anchor_date = read_date(state[ANCHOR])
+    last_task_date = read_date(state[LAST_TASK])
+    if state["streak"] == 0:
+        if anchor_date is not None or last_task_date is not None:
+            raise ValueError("An inactive streak must have empty dates.")
+        if state["streak_shields"] != 0 or state["streak_last_processed_period"] != -1:
+            raise ValueError("An inactive streak must have empty dates, no shield, and processed period -1.")
+        return
+    if anchor_date is None or last_task_date is None:
+        raise ValueError("An active streak needs an anchor date and latest task date.")
+    if anchor_date > last_task_date:
+        raise ValueError("The anchor cannot be after the latest task date.")
+    if last_task_date > on_date:
+        raise ValueError("The latest task date cannot be in the future (UTC).")
+    # // 7 counts whole seven-day periods: 0 for days 1-7, 1 for days 8-14.
+    current_period = (on_date - anchor_date).days // 7
+    last_completed_period = (last_task_date - anchor_date).days // 7
+    last_processed_period = state["streak_last_processed_period"]
+    if last_processed_period >= current_period:
+        raise ValueError("The current period is still open; it cannot be marked processed.")
+    if last_processed_period < last_completed_period - 1:
+        raise ValueError("Periods before the latest task's period must already be processed.")
+
+
+def advance_streak(data, on_date):
+    """Close elapsed periods exactly once, including after bot downtime."""
+    state = normalize_streak(data, on_date)
+    events = []
+    if state["streak"] == 0:
+        return state, events
+    anchor_date = read_date(state[ANCHOR])
+    last_task_date = read_date(state[LAST_TASK])
+    current_period = (on_date - anchor_date).days // 7
+    last_completed_period = (last_task_date - anchor_date).days // 7
+    first_unchecked_period = state["streak_last_processed_period"] + 1
+    # range excludes the current period: it is still open, so it cannot be missed.
+    for period in range(first_unchecked_period, current_period):
+        if period != last_completed_period:
+            if state["streak_shields"] == 1:
+                state["streak_shields"] = 0
+                events.append("shield_used")
+            else:
+                events.append("streak_reset")
+                return empty_streak(), events
+        state["streak_last_processed_period"] = period
+    return state, events
+
+
+def record_task(data, on_date):
+    """Award one weekly increase OR one shield, returning the pre-award streak.
+
+    Resolve expiry before calculating the points bonus. The caller must ensure that
+    this is a new qualifying task, and persist the result atomically with its claim.
+    """
+    state, events = advance_streak(data, on_date)
+    bonus_streak = min(state["streak"], 4)
+    if state["streak"] == 0:
+        state[ANCHOR] = on_date.isoformat()
+        state["streak"] = 1
+        events.append("streak_started")
+    else:
+        anchor_date = read_date(state[ANCHOR])
+        last_task_date = read_date(state[LAST_TASK])
+        current_period = (on_date - anchor_date).days // 7
+        last_completed_period = (last_task_date - anchor_date).days // 7
+        if current_period != last_completed_period:
+            state["streak"] += 1
+            events.append("streak_increased")
+        elif state["streak_shields"] == 0:
+            state["streak_shields"] = 1
+            events.append("shield_earned")
+    state[LAST_TASK] = on_date.isoformat()
+    return state, events, bonus_streak
+
+
+def streak_reminder(state, on_date):
+    """Return the final-two-days reminder for an unfinished current period."""
+    if state["streak"] == 0:
+        return None
+    anchor_date = read_date(state[ANCHOR])
+    last_task_date = read_date(state[LAST_TASK])
+    elapsed_days = (on_date - anchor_date).days
+    current_period = elapsed_days // 7
+    day_in_period = elapsed_days % 7  # 0 is the first day; 5 and 6 are the last two.
+    last_completed_period = (last_task_date - anchor_date).days // 7
+    reminder_key = f"{current_period}:{day_in_period}"
+    if last_completed_period == current_period:
+        return None
+    if day_in_period < 5:
+        return None
+    if state["streak_last_reminder_key"] == reminder_key:
+        return None
+    deadline = anchor_date + timedelta(days=current_period * 7 + 6)
+    if state["streak_shields"] == 1:
+        consequence = "Your shield will be used if you miss this period; your streak will stay the same."
+    else:
+        consequence = "Your streak will reset if you miss this period."
+    return {
+        "key": reminder_key,
+        "message": (
+            f"Your task streak is {state['streak']}. This period is still unfinished. "
+            f"Complete a task by the end of {deadline.isoformat()} (UTC). {consequence}"
+        ),
+    }
+
+
+def edit_streak_fields(data, on_date, changes):
+    """Validate an admin repair as a single state change, without closing weeks."""
+    allowed = {"streak", ANCHOR, LAST_TASK, "streak_shields", "streak_last_processed_period"}
+    for field in changes:
+        if field not in allowed:
+            raise ValueError("Unknown streak field.")
+    # An explicit zero is also a way to repair malformed historical state.
+    if changes.get("streak") == 0:
+        for field, value in changes.items():
+            if field != "streak" and value not in (None, 0, -1):
+                raise ValueError("Resetting a streak also clears its dates, shield, and processed period.")
+        return empty_streak()
+    # Apply supplied repairs before validation, so invalid saved values can be fixed.
+    if data.get("streak_version") == STREAK_VERSION:
+        state = empty_streak()
+        for field in state:
+            if field in data:
+                state[field] = data[field]
+    else:
+        state = normalize_streak(data, on_date)
+    if state["streak"] == 0 and changes.get("streak", 0) > 0:
+        state[ANCHOR] = on_date.isoformat()
+        state[LAST_TASK] = on_date.isoformat()
+    state.update(changes)
+    state["streak_last_reminder_key"] = None
+    # Explicitly changing dates is an admin rebase: previous periods are settled.
+    if ANCHOR in changes or LAST_TASK in changes:
+        anchor = read_date(state[ANCHOR])
+        if anchor and "streak_last_processed_period" not in changes:
+            state["streak_last_processed_period"] = (on_date - anchor).days // 7 - 1
+    validate_streak(state, on_date)
+    return state
+
 
 def get_guild(): #function to the get the guild ID, used in slash commands to sync quickly
     serverID =config.get("server_id")
@@ -243,26 +446,46 @@ async def fetch_submission_message(message_link: str) -> discord.Message:
 def is_thread_claimed(channel_id: int) -> bool:
     return db.collection(threads_collection).document(str(channel_id)).get().exists
 
-async def claim_thread(message:discord.Message, tag: str):
-    db.collection(threads_collection).document(str(message.channel.id)).set({
-        'channel_name': message.channel.name,
-        'user_id': message.author.id,
-        'user_name': message.author.name,
-        'tag': tag,
-        'awarded_at': str(today())
-    })
 
-def update_task_streak(message, user_data):
-    if is_thread_claimed(message.channel.id):
-        return
-    # Existing date fields now track all task forum submissions.
-    changes = {'last_worksheet_date': str(today())}
-    if missed_last_week(user_data.get('first_worksheet_thisWeek_date')):
-        changes['first_worksheet_thisWeek_date'] = str(today())
-        changes['streak'] = firestore.Increment(1)
-    db.collection(users_collection).document(str(message.author.id)).update(changes)
+@firestore.transactional
+def award_forum_task(transaction, user_ref, thread_ref, claim, reward_units, on_date, base_points=worksheet_points):
+    # Read before writing. Firestore retries this function if another update
+    # changes either document. Keep Discord messages outside this function.
+    claimed = thread_ref.get(transaction=transaction)
+    snapshot = user_ref.get(transaction=transaction)
+    data = snapshot.to_dict()
+    if data is None:
+        data = {}
+    if claimed.exists:
+        return None
 
-async def send_points_message(user, points, activity, sorted_data, show_streak=False):
+    state, events, bonus_streak = record_task(data, on_date)
+    points_per_reward = int(base_points * (1 + bonus_streak * weekly_bonuspercent / 100))
+    points = reward_units * points_per_reward
+    changes = missing_user_defaults(data)
+    changes.update(state)
+    changes['points'] = firestore.Increment(points)
+    # The points, streak, shield and thread claim either all save, or none do.
+    transaction.set(user_ref, changes, merge=True)
+    transaction.create(thread_ref, claim)
+    return {'state': state, 'events': events, 'bonus_streak': bonus_streak, 'points': points}
+
+
+def streak_event_text(events):
+    messages = {
+        'streak_started': "Your task streak has started!",
+        'streak_increased': "This period is complete: your streak increased by 1.",
+        'shield_earned': "You earned a shield! It protects one missed period (maximum 1).",
+        'shield_used': "Your shield protected a missed period; that period earned no streak increase.",
+        'streak_reset': "Your previous streak ended because a period was missed without a shield.",
+    }
+    lines = []
+    for event_name in events:
+        lines.append(messages[event_name])
+    return "\n".join(lines)
+
+
+async def send_points_message(user, points, activity, sorted_data, show_streak=False, streak_events=None):
     position = 0
     for index, row in enumerate(sorted_data):
         if row['id'] == str(user.id):
@@ -282,6 +505,9 @@ async def send_points_message(user, points, activity, sorted_data, show_streak=F
     embed.set_thumbnail(url="https://i.ibb.co/BKLCTWv5/4ab2bbcfa5b9a10891406d2a84e94004.webp")
     if show_streak:
         embed.add_field(name="🔥 Current Streak", value=f"**{streak}** weeks", inline=True)
+        embed.add_field(name="🛡️ Shield", value=f"**{row.get('streak_shields', 0)}/1**", inline=True)
+        if streak_events:
+            embed.add_field(name="Streak update", value=streak_event_text(streak_events), inline=False)
     embed.add_field(name="🪙 Points Earned", value=f"**+{points}**", inline=True)
     embed.add_field(name="📊 Leaderboard Rank", value=f"**#{position}**", inline=True)
     embed.add_field(name="🪙 Total Points", value=f"**{total_points}**", inline=True)
@@ -307,13 +533,15 @@ async def handle_writing(message:discord.Message, user_data: dict, points:int = 
 
     if user_data.get('last_writing_date') != str(today()) or not check_last_sent_time:
         if len(message.content) >= min_length or admin_approved:
+            if tag:
+                # handle_message checks both parts, then saves one forum reward.
+                if not alone:
+                    return points
+                return await reward_forum_task(message, tag, 1)
             changes = {'points': firestore.Increment(points)}
             if not tag:
                 changes['last_writing_date'] = str(today())
             db.collection(users_collection).document(str(message.author.id)).update(changes)
-            if tag:
-                update_task_streak(message, user_data)
-                await claim_thread(message, tag)
             await message.add_reaction(emoji)
             sorted_data = await update_leaderboard()
             activity = f"🎉 {tag.title()} Completed" if tag else "📝 Writing Completed"
@@ -325,13 +553,15 @@ async def handle_writing(message:discord.Message, user_data: dict, points:int = 
         elif message.attachments:
             for attachment in message.attachments:
                 if attachment.content_type and attachment.content_type.startswith("image"):
+                    if tag:
+                        # handle_message checks both parts, then saves one forum reward.
+                        if not alone:
+                            return points
+                        return await reward_forum_task(message, tag, 1)
                     changes = {'points': firestore.Increment(points)}
                     if not tag:
                         changes['last_writing_date'] = str(today())
                     db.collection(users_collection).document(str(message.author.id)).update(changes)
-                    if tag:
-                        update_task_streak(message, user_data)
-                        await claim_thread(message, tag)
                     await message.add_reaction(emoji)  # adds the text points emoji
                     sorted_data = await update_leaderboard()
                     activity = f"🎉 {tag.title()} Completed" if tag else "🖼️ Image Submission Completed"
@@ -357,13 +587,15 @@ async def handle_speaking(message:discord.Message, user_data: dict, points:int =
     if user_data.get('last_speaking_date') != str(today()) or not check_last_sent_time:
         for attachment in message.attachments:
             if attachment.is_voice_message() and (admin_approved or attachment.duration >= min_length):
+                if tag:
+                    # handle_message checks both parts, then saves one forum reward.
+                    if not alone:
+                        return points
+                    return await reward_forum_task(message, tag, 1)
                 changes = {'points': firestore.Increment(points)}
                 if not tag:
                     changes['last_speaking_date'] = str(today())
                 db.collection(users_collection).document(str(message.author.id)).update(changes)
-                if tag:
-                    update_task_streak(message, user_data)
-                    await claim_thread(message, tag)
                 await message.add_reaction(emoji)  # adds the voice points emoji
                 sorted_data = await update_leaderboard()
                 activity = f"🎉 {tag.title()} Completed" if tag else "🎤 Speaking Completed"
@@ -403,38 +635,9 @@ async def handle_worksheets(message:discord.Message, user_data: dict, points:int
         await log(f"{message.author.mention} sent a message in {message.channel.mention}, but it was shorter than {min_worksheet_length}, points awarded: Zero")
         return 0
 
-    effective_streak = min(user_data.get('streak'), 4)
-
     try:
-        first_date = user_data.get('first_worksheet_thisWeek_date')
-        effective_points = int(points * (1 + effective_streak * weekly_bonuspercent / 100))
-        if missed_last_week(first_date):
-            # new window, streak +1
-            db.collection(users_collection).document(str(message.author.id)).update({
-                'points': firestore.Increment(effective_points),
-                'last_worksheet_date': str(today()),
-                'first_worksheet_thisWeek_date': str(today()),
-                'streak': firestore.Increment(1)
-            })
-            if tag:
-                await claim_thread(message, tag)
-            await message.add_reaction(emoji[effective_streak])
-            await log(
-                f"{message.author.mention} sent a worksheet answer in {message.channel.mention}, points awarded: {effective_points}, streak: increased by 1")
-        else:
-            # within window, points with streak bonus but no streak increment
-            db.collection(users_collection).document(str(message.author.id)).update({
-                'points': firestore.Increment(effective_points),
-                'last_worksheet_date': str(today()),
-            })
-            if tag:
-                await claim_thread(message, tag)
-            await message.add_reaction(emoji[effective_streak])
-            await log(
-                f"{message.author.mention} sent a worksheet answer in {message.channel.mention}, points awarded: {effective_points}, streak: not increased because their last one was within 7 days ")
-        sorted_data = await update_leaderboard()
-        await send_points_message(message.author, effective_points, "🎉 Worksheet Completed", sorted_data, show_streak=True)
-        return effective_points
+        # The checks above are unchanged. Save points, streak and claim together.
+        return await reward_forum_task(message, tag, 1, points, emoji, "🎉 Worksheet Completed")
 
     except Exception as e:
         await log(f"[DEBUG] worksheet block crashed: {e}")
@@ -499,6 +702,46 @@ async def handle_phrase_of_the_week(message:discord.Message):
     return phrase_of_the_week_points
 
 
+async def handle_recommendation(message:discord.Message):
+    db.collection(users_collection).document(str(message.author.id)).update({
+        'points': firestore.Increment(recommendation_points)
+    })
+    await message.add_reaction(recommendation_emoji)
+    await update_leaderboard()
+    await log(f"{message.author.mention} posted a recommendation in {message.channel.mention}, points awarded: {recommendation_points}")
+    return recommendation_points
+
+
+async def reward_forum_task(message, tag, reward_units, base_points=worksheet_points,
+                            emoji=None, activity=None):
+    """Save one task, even when both writing and speaking earned points."""
+    if emoji is None:
+        emoji = worksheet_points_emojis
+    if activity is None:
+        activity = f"🎉 {tag.title()} Completed"
+    award_date = today()
+    claim = {
+        'channel_name': message.channel.name,
+        'user_id': message.author.id,
+        'user_name': message.author.name,
+        'tag': tag,
+        'awarded_at': str(award_date),
+    }
+    user_ref = db.collection(users_collection).document(str(message.author.id))
+    thread_ref = db.collection(threads_collection).document(str(message.channel.id))
+    result = award_forum_task(db.transaction(), user_ref, thread_ref, claim,
+                              reward_units, award_date, base_points)
+    if result is None:
+        return 0
+    await message.add_reaction(emoji[result['bonus_streak']])
+    sorted_data = await update_leaderboard()
+    await send_points_message(message.author, result['points'], activity, sorted_data,
+                              show_streak=True, streak_events=result['events'])
+    await log(f"{message.author.mention} sent a task in {message.channel.mention}, "
+              f"points awarded: {result['points']}. {streak_event_text(result['events'])}")
+    return result['points']
+
+
 async def handle_message(message:discord.Message, user_data: dict, voice_points:int = voice_points, text_points:int = text_points,
                          voice_emoji:str = voice_points_emoji, text_emoji:str = text_points_emoji, min_speaking_length: int =min_speaking_length,
                          min_length:int = min_written_length, check_last_sent_time: bool = True, tag:str = None, admin_approved:bool = False):
@@ -507,13 +750,22 @@ async def handle_message(message:discord.Message, user_data: dict, voice_points:
         return 0
 
     awarded_points = 0
+    reward_units = 0
     if not (admin_approved and has_voice_message(message)): # only skips admin approved and has voice
-        awarded_points += await handle_writing(message, user_data, points=text_points, emoji=text_emoji, min_length=min_length,
+        writing_points = await handle_writing(message, user_data, points=text_points, emoji=text_emoji, min_length=min_length,
                              alone=False, check_last_sent_time=check_last_sent_time, tag=tag,
                              admin_approved=admin_approved)
+        awarded_points += writing_points
+        if writing_points > 0:
+            reward_units += 1
 
-    awarded_points += await handle_speaking(message, user_data, points= voice_points, emoji = voice_emoji, min_length= min_speaking_length,
+    speaking_points = await handle_speaking(message, user_data, points= voice_points, emoji = voice_emoji, min_length= min_speaking_length,
                           alone = False, check_last_sent_time=check_last_sent_time, tag=tag, admin_approved = admin_approved)
+    awarded_points += speaking_points
+    if speaking_points > 0:
+        reward_units += 1
+    if tag and reward_units > 0:
+        return await reward_forum_task(message, tag, reward_units)
     return awarded_points
 
 async def handle_forum_task(message: discord.Message, user_data: dict, admin_approved: bool = False):
@@ -526,9 +778,9 @@ async def handle_forum_task(message: discord.Message, user_data: dict, admin_app
         await log(f"Follow up message sent in {channel.mention} by {message.author.mention}")
         return 0
 
-    streak = min(user_data.get('streak', 0), 4)
-    task_points = int(worksheet_points * (1 + streak * weekly_bonuspercent / 100))
-    task_emoji = worksheet_points_emojis[streak]
+    # The final bonus is calculated when saving, after checking for expiry.
+    task_points = worksheet_points
+    task_emoji = worksheet_points_emojis[0]
     recognized_tag = False
 
     for tag in channel.applied_tags:
@@ -615,7 +867,8 @@ async def configure(interaction: discord.Interaction, franco_channel: discord.Te
                     dictation_channel :discord.TextChannel, vip_questions_channel: discord.TextChannel,
                     task_forum :discord.ForumChannel,leaderboard_channel: discord.TextChannel,
                     weekly_leaderboard_channel: discord.TextChannel, phrase_of_the_week_channel: discord.TextChannel,
-                    log_channel: discord.TextChannel, admin1: discord.Member, admin2: discord.Member):
+                    log_channel: discord.TextChannel, admin1: discord.Member, admin2: discord.Member,
+                    recommendations_channel: discord.TextChannel = None):
     if config.get("server_id") is None:
         await interaction.response.send_message("Please set the server ID first by typing .setserver", ephemeral = True)
         return
@@ -626,6 +879,10 @@ async def configure(interaction: discord.Interaction, franco_channel: discord.Te
             "task_forum_id": str(task_forum.id), 'phrase_of_the_week_channel_id':str(phrase_of_the_week_channel.id),
             'leaderboard_channel_id' : str(leaderboard_channel.id), 'weekly_leaderboard_id':str(weekly_leaderboard_channel.id),
             'log_channel_id' : str(log_channel.id), 'admin1' : str(admin1.id), 'admin2' : str(admin2.id)},merge=True)
+        if recommendations_channel is not None:
+            db.collection(config_collection).document('settings').set({
+                'recommendations_channel_id': str(recommendations_channel.id)
+            }, merge=True)
         config.update(load_config())
         await interaction.response.send_message("Config updated successfully!", ephemeral = True)
         start_background_tasks()
@@ -665,30 +922,104 @@ async def remove_points(interaction: discord.Interaction, user: discord.User, po
     await log(f"{points} points removed from {user.mention}")
     await update_leaderboard()
 
+@firestore.transactional
+def save_streak_fields(transaction, user_ref, on_date, changes):
+    snapshot = user_ref.get(transaction=transaction)
+    data = snapshot.to_dict()
+    if data is None:
+        data = {}
+    # Setting only the count must not accidentally revive already expired dates.
+    if len(changes) == 1 and 'streak' in changes and changes['streak'] > 0:
+        state, unused_events = advance_streak(data, on_date)
+        data.update(state)
+    state = edit_streak_fields(data, on_date, changes)
+    fields = missing_user_defaults(data)
+    fields.update(state)
+    transaction.set(user_ref, fields, merge=True)
+    return state
+
+
+def format_streak_fields(state):
+    lines = []
+    for field in ('streak', ANCHOR, LAST_TASK, 'streak_shields', 'streak_last_processed_period'):
+        lines.append(f"{field}: {state[field]}")
+    return "\n".join(lines)
+
+
+@bot.tree.command(name="streak_fields", description="Shows a member's current streak fields", guild=get_guild())
+@discord.app_commands.checks.has_permissions(administrator=True)
+async def streak_fields(interaction: discord.Interaction, user: discord.Member):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        user_ref = db.collection(users_collection).document(str(user.id))
+        result = refresh_streak(db.transaction(), user_ref, today(), send_reminder=False)
+        await interaction.followup.send(
+            f"Streak fields for {user.mention} (UTC):\n{format_streak_fields(result['state'])}",
+            ephemeral=True,
+        )
+    except ValueError as error:
+        await interaction.followup.send(str(error), ephemeral=True)
+
+
+@bot.tree.command(name="set_streak_field", description="Sets one streak field with validation", guild=get_guild())
+@discord.app_commands.checks.has_permissions(administrator=True)
+@app_commands.choices(field=[
+    Choice(name="Streak count", value="streak"),
+    Choice(name="Personal period anchor (YYYY-MM-DD)", value="first_worksheet_thisWeek_date"),
+    Choice(name="Latest qualifying task (YYYY-MM-DD)", value="last_worksheet_date"),
+    Choice(name="Shield balance (0 or 1)", value="streak_shields"),
+    Choice(name="Last processed period (-1 before any close)", value="streak_last_processed_period"),
+])
+async def set_streak_field(interaction: discord.Interaction, user: discord.Member,
+                           field: Choice[str], value: str):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        if field.value in (ANCHOR, LAST_TASK):
+            parsed_value = date.fromisoformat(value).isoformat()
+            if parsed_value != value:
+                raise ValueError("Enter dates as YYYY-MM-DD.")
+        else:
+            parsed_value = int(value)
+        user_ref = db.collection(users_collection).document(str(user.id))
+        state = save_streak_fields(db.transaction(), user_ref, today(), {field.value: parsed_value})
+        await interaction.followup.send(
+            f"Updated {user.mention}:\n{format_streak_fields(state)}", ephemeral=True,
+        )
+        await log(f"{interaction.user.mention} set {field.value} to {parsed_value} for {user.mention}")
+        await update_leaderboard()
+    except ValueError as error:
+        await interaction.followup.send(f"Cannot set that field: {error}", ephemeral=True)
+
+
 @bot.tree.command(name="set_streak", description="sets the streak for a certain user", guild=get_guild())
 @discord.app_commands.checks.has_permissions(administrator=True)
 async def set_streak(interaction: discord.Interaction, user: discord.Member, streak: int):
     try:
-        db.collection(users_collection).document(f'{str(user.id)}').set({'streak': streak}, merge=True)
+        user_ref = db.collection(users_collection).document(str(user.id))
+        save_streak_fields(db.transaction(), user_ref, today(), {'streak': streak})
         await log(f"set streak for {user.mention} to {streak} by {interaction.user.mention}")
         await interaction.response.send_message(f"set streak for {user.mention} to {streak}", ephemeral=True)
         await update_leaderboard()
+    except ValueError as e:
+        await interaction.response.send_message(str(e), ephemeral=True)
     except Exception as e:
         await log(f"Error setting streak for {user.name}: {e}")
 
-@bot.tree.command(name="reset_date", description="resets a select date for a certain user", guild=get_guild())
+@bot.tree.command(name="reset_date", description="Resets a daily writing or speaking activity date", guild=get_guild())
 @discord.app_commands.checks.has_permissions(administrator=True)
 @app_commands.choices(date=[
-    Choice(name="Date of the first worksheet sent this week", value="first_worksheet_thisWeek_date"),
-    Choice(name="Date of the last worksheet sent", value="last_worksheet_date"),
-    Choice(name=f"Date of the last voice note in the speaking channel", value="last_speaking_date"),
-    Choice(name="Date of the last message sent in either writing channel", value="last_writing_date")
+    Choice(name="Date of the last voice note in the speaking channel", value="last_speaking_date"),
+    Choice(name="Date of the last message sent in either writing channel", value="last_writing_date"),
 ])
 async def reset_date(interaction: discord.Interaction, user: discord.Member, date: Choice[str]):
-    date_to_reset = date.value
-    db.collection(users_collection).document(f'{str(user.id)}').set({f'{date_to_reset}': "2000-01-01"}, merge = True)
+    # Streak dates must be edited together with the streak's bookkeeping.
+    if date.value not in ('last_speaking_date', 'last_writing_date'):
+        await interaction.response.send_message("Use /set_streak_field for streak dates.", ephemeral=True)
+        return
+    db.collection(users_collection).document(str(user.id)).set({date.value: "2000-01-01"}, merge=True)
     await interaction.response.send_message(f"{date.name} was reset for {user.mention}", ephemeral=True)
     await log(f"{date.name} was reset for {user.mention} by {interaction.user.mention}")
+
 
 @bot.tree.command(name="award_submission", description="Award the submission of a certain user", guild=get_guild())
 @discord.app_commands.checks.has_permissions(administrator=True)
@@ -699,6 +1030,7 @@ async def reset_date(interaction: discord.Interaction, user: discord.Member, dat
     Choice(name="Writing", value="writing"),
     Choice(name=f"VIP Question", value="VIP_question"),
     Choice(name=f"Phrase Of The Week", value="phrase_of_the_week"),
+    Choice(name="Recommendation", value="recommendation"),
 ])
 async def award_submission(interaction: discord.Interaction, message_link: str, task_type: Choice[str]):
     await interaction.response.defer(ephemeral=True)
@@ -735,6 +1067,9 @@ async def award_submission(interaction: discord.Interaction, message_link: str, 
         elif task_type.value == "phrase_of_the_week":
             awarded_points = await handle_phrase_of_the_week(message)
             skip_reason = "No Phrase Of The Week reward was awarded."
+        elif task_type.value == "recommendation":
+            awarded_points = await handle_recommendation(message)
+            skip_reason = "No recommendation reward was awarded."
 
         else:
             raise ValueError("Choose one of the listed task types.")
@@ -789,6 +1124,7 @@ async def on_message(message):
         config.get("dictation_channel_id"),
         config.get("vip_questions_channel_id"),
         config.get("phrase_of_the_week_channel_id"),
+        config.get("recommendations_channel_id"),
     ]
     if (message.channel.id not in tracked_channels) and not is_task_thread:
         await bot.process_commands(message)
@@ -822,6 +1158,9 @@ async def on_message(message):
 
     if message.channel.id == config['phrase_of_the_week_channel_id']:
         await handle_phrase_of_the_week(message)
+
+    if message.channel.id == config.get('recommendations_channel_id'):
+        await handle_recommendation(message)
 
     await bot.process_commands(message) #crucial so the bot can process written commands like .setserver
 
@@ -908,45 +1247,76 @@ async def weekly_leaderboard():
     await channel.send(embed=embed)
     await log(f"Weekly Leaderboard sent")
 
-# daily check streaks
-@tasks.loop(time=time(hour=0, minute=0, second=0, tzinfo=timezone.utc))
-# @bot.tree.command(name="check_streaks", description="checks the streaks and resets if they haven't posted within a week", guild=get_guild())
-async def check_streaks():
-    all_users = db.collection(users_collection).get()
-    for user in all_users:
-        user_data = user.to_dict()
-        record_date = date.fromisoformat(user_data.get('last_worksheet_date', '2000-01-01'))
-        days_from_last = (today() - record_date).days
-        streak = user_data.get('streak', 0) #zero in the bracket is the fallback value
-        member = bot.get_user(int(user.id))
-        if days_from_last > 7 and streak > 0:
-            db.collection(users_collection).document(user.id).update({'streak': 0})
-            await log(f"Reset streak for <@{user.id}>, their streak was {streak}")
-            if member:
-                try:
-                    await member.send(f"Hey, sorry to say, but your task streak of {streak} has been reset. You can start fresh with any task forum activity!"
-                                      f"\nIf you need help, you can ask <@{config['admin1']}> or <@{config['admin2']}> at any time!")
-                except discord.Forbidden:
-                    await log(f"Could not sent streak reset message for {member.mention}, because they have their DMs closed")
-            else:
-                await log(f"could not send streak reminder for <@{user.id}>")
-        elif days_from_last >= 5 and streak !=0:
-            await log(f"sent streak reminder for <@{user.id}>")
-            date_until_reset = (record_date + timedelta(days=7)).isoformat()
-            if member:
-                if days_from_last == 7:
-                    msg = f"Hi, just wanted to remind you that today is your last day to keep your streak of {streak} alive. Complete a task forum activity to keep it going! \nYour streak expiry date is: {date_until_reset}"
-                elif days_from_last == 6:
-                    msg = f"Hello {member.mention}! Your streak is {streak}. Complete a task forum activity when you can! \nYour streak expiry date is: {date_until_reset}"
-                else:
-                    msg = f"Hey, just a reminder that your streak of {streak} is going strong! Complete a task forum activity in the next 2 days to keep it alive! \nYour streak expiry date is: {date_until_reset}"
-                try:
-                    await member.send(msg)
-                except discord.Forbidden:
-                    await log(f"Could not sent streak reminder message for {member.mention}, because they have their DMs closed")
-            else:
-                await log(f"could not send streak reminder for <@{user.id}>")
+@firestore.transactional
+def refresh_streak(transaction, user_ref, on_date, send_reminder=True):
+    snapshot = user_ref.get(transaction=transaction)
+    data = snapshot.to_dict()
+    if data is None:
+        data = {}
+    state, events = advance_streak(data, on_date)
+    reminder = None
+    if send_reminder:
+        reminder = streak_reminder(state, on_date)
+        if reminder:
+            # Reserve this notice before sending, so retries/restarts cannot spam it.
+            state['streak_last_reminder_key'] = reminder['key']
+    fields = missing_user_defaults(data)
+    fields.update(state)
+    changes = {}
+    for field, value in fields.items():
+        if field not in data or data[field] != value:
+            changes[field] = value
+    if changes:
+        transaction.set(user_ref, changes, merge=True)
+    return {'state': state, 'events': events, 'reminder': reminder}
 
+
+async def run_streak_checks():
+    check_date = today()
+    changed_streak = False
+    for user in db.collection(users_collection).get():
+        try:
+            user_ref = db.collection(users_collection).document(user.id)
+            result = refresh_streak(db.transaction(), user_ref, check_date)
+            messages = []
+            if result['events']:
+                changed_streak = True
+                messages.append(streak_event_text(result['events']))
+            if result['reminder']:
+                messages.append(result['reminder']['message'])
+            if not messages:
+                continue
+
+            member = bot.get_user(int(user.id))
+            if member is None:
+                member = await bot.fetch_user(int(user.id))
+            # A task might have arrived while fetching this Discord user.
+            if result['reminder']:
+                latest_state = normalize_streak(user_ref.get().to_dict(), check_date)
+                if latest_state[LAST_TASK] != result['state'][LAST_TASK]:
+                    messages.remove(result['reminder']['message'])
+            if messages:
+                await member.send("\n".join(messages))
+            await log(f"Checked task streak for <@{user.id}>: " + " ".join(messages))
+        except discord.HTTPException as error:
+            await log(f"Could not deliver streak notice to <@{user.id}>: {error}")
+        except Exception as error:
+            # One damaged record or failed request must not stop all users' checks.
+            await log(f"Could not check streak for <@{user.id}>: {error}")
+    if changed_streak:
+        await update_leaderboard()
+
+
+@tasks.loop(time=time(hour=0, minute=0, second=0, tzinfo=timezone.utc))
+async def check_streaks():
+    await run_streak_checks()
+
+
+@check_streaks.before_loop
+async def prepare_streak_checks():
+    await bot.wait_until_ready()
+    # Reconcile missed boundaries after a restart, without waiting for midnight.
+    await run_streak_checks()
 
 
 webserver.keep_alive()

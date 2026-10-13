@@ -8,7 +8,7 @@ The goal is to help members stay active and make the learning experience better.
 
 ## What it does
 
-- Awards points for writing, speaking, dictation, questions, and task submissions.
+- Awards points for writing, speaking, dictation, questions, recommendations, and task submissions.
 - Tracks weekly task streaks and gives bonus points for keeping them going.
 - Shows leaderboards and gives roles to the monthly winners.
 - Sends points updates and reminders when a streak is about to expire.
@@ -58,8 +58,10 @@ These commands require Discord Administrator permission. Members earn points thr
 | `/leaderboard` | Refreshes the leaderboard. |
 | `/add_points` | Adds points to a user and sends them a reward DM when the amount is positive. |
 | `/remove_points` | Removes points from a user. |
-| `/set_streak` | Sets a user's streak to the number you choose. |
-| `/reset_date` | Resets a user's saved writing, speaking, or worksheet activity date. |
+| `/streak_fields` | Shows a user's current streak fields after processing elapsed periods. |
+| `/set_streak_field` | Sets a streak count, anchor date, latest task date, shield balance, or processed period with validation. |
+| `/set_streak` | Sets the streak count; zero clears its dates and shield. Starting an inactive streak marks today's period complete. |
+| `/reset_date` | Resets a user's saved daily writing or speaking activity date. Use `/set_streak_field` for streak dates. |
 | `/award_submission` | Manually checks and rewards a submission using its message link and activity type. |
 
 ## Running your own copy
@@ -111,5 +113,7 @@ python main.py
 ```
 
 As a server admin, use `/configure` to select the admins and channels. If you haven't set `server_id` in Firestore, use `.setserver` first and restart the bot so its commands sync to your server.
+
+Set the optional `recommendations_channel` in `/configure` to your `recommendations` text channel (or set `recommendations_channel_id` in Firestore before starting the bot). Each post there earns 5 points and receives the existing `vip_question_emoji` reaction. The usual admin and bot exclusions apply; there is no daily limit. Admins can also select `Recommendation` in `/award_submission`.
 
 Some messages and learning activities are specific to Linguazad. You can change those in `main.py` to fit your own community.
