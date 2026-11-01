@@ -14,7 +14,9 @@ __pycache__/
 .idea/
 .vscode/
 test.py
-tests/
+tests/*
+!tests/test_*.py
+!tests/streak_test_helpers.py
 
 #JSON file
 config.json

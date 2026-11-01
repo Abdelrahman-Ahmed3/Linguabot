@@ -177,6 +177,7 @@ async def update_leaderboard(): #function to update the leaderboard, returns sor
     embed = discord.Embed(title="🏆 Leaderboard", color=discord.Color.gold()) #creates an embed with only the title and colour
     embed.set_thumbnail(url="https://i.ibb.co/BKLCTWv5/4ab2bbcfa5b9a10891406d2a84e94004.webp") #sets a thumbnail to the embed
     embed.timestamp = discord.utils.utcnow() #adds a timestamp at the bottom of the embed
+    embed.set_footer(text="Tip: Use /my_streak to check your personal streak & deadline!")
     for i, user in enumerate(sorted_data): #enumerate adds numbers to each item in the dict, used to display the rankings
         member = bot.get_user(int(user['id']))
         display_name = member.display_name if member else "Unknown User" # fallback if the member isn't the bot's memory for some reason
@@ -349,16 +350,34 @@ def streak_reminder(state, on_date):
     if state["streak_last_reminder_key"] == reminder_key:
         return None
     deadline = anchor_date + timedelta(days=current_period * 7 + 6)
+    deadline_dt = datetime.combine(deadline + timedelta(days=1), time(0, 0, 0), tzinfo=timezone.utc)
+    deadline_ts = int(deadline_dt.timestamp())
+    streak = state["streak"]
     if state["streak_shields"] == 1:
-        consequence = "Your shield will be used if you miss this period; your streak will stay the same."
+        if day_in_period == 6:
+            consequence = "(Don't worry, your shield will be used if you miss today to keep your streak safe)."
+        else:
+            consequence = "(You have 1 shield: if you miss this week, your shield will be used to protect your streak)."
     else:
-        consequence = "Your streak will reset if you miss this period."
+        if day_in_period == 6:
+            consequence = "⚠️ If you miss today, your streak will reset."
+        else:
+            consequence = "⚠️ Your streak will reset if you miss this week."
+
+    if day_in_period == 6:
+        header = f"Hi, just wanted to remind you that today is your **last day** to keep your streak of {streak} alive! Complete a task forum activity to keep it going!"
+    else:
+        header = f"Hey, just a reminder that your streak of {streak} is going strong! Complete a task forum activity in the next 2 days to keep it alive!"
+
+    message = (
+        f"{header}\n\n"
+        f"⏳ **Deadline:** <t:{deadline_ts}:R> (<t:{deadline_ts}:f>)\n"
+        f"{consequence}\n\n"
+        f"💡 *Tip: Use `/my_streak` anytime to check your deadline and streak!*"
+    )
     return {
         "key": reminder_key,
-        "message": (
-            f"Your task streak is {state['streak']}. This period is still unfinished. "
-            f"Complete a task by the end of {deadline.isoformat()} (UTC). {consequence}"
-        ),
+        "message": message,
     }
 
 
@@ -472,12 +491,18 @@ def award_forum_task(transaction, user_ref, thread_ref, claim, reward_units, on_
 
 
 def streak_event_text(events):
+    admin_help = ""
+    if config.get("admin1") and config.get("admin2"):
+        admin_help = f"\nIf you need help, you can ask <@{config['admin1']}> or <@{config['admin2']}> at any time!"
+    elif config.get("admin1"):
+        admin_help = f"\nIf you need help, you can ask <@{config['admin1']}> at any time!"
+
     messages = {
-        'streak_started': "Your task streak has started!",
-        'streak_increased': "This period is complete: your streak increased by 1.",
-        'shield_earned': "You earned a shield! It protects one missed period (maximum 1).",
-        'shield_used': "Your shield protected a missed period; that period earned no streak increase.",
-        'streak_reset': "Your previous streak ended because a period was missed without a shield.",
+        'streak_started': "🔥 You started a new weekly task streak! Keep it going next week!",
+        'streak_increased': "🔥 Weekly streak increased! Great work keeping it up!",
+        'shield_earned': "🛡️ You earned a Streak Shield! It will protect your streak if you miss a week (max 1).",
+        'shield_used': "🛡️ Your streak shield protected one missed week. To earn a replacement shield, complete a second qualifying task within the same active week. Use /my_streak to check your deadline.",
+        'streak_reset': f"Hey, sorry to say, but your task streak has been reset because you missed a week without a shield. You can start fresh with any task forum activity!{admin_help}",
     }
     lines = []
     for event_name in events:
@@ -504,14 +529,14 @@ async def send_points_message(user, points, activity, sorted_data, show_streak=F
     )
     embed.set_thumbnail(url="https://i.ibb.co/BKLCTWv5/4ab2bbcfa5b9a10891406d2a84e94004.webp")
     if show_streak:
-        embed.add_field(name="🔥 Current Streak", value=f"**{streak}** weeks", inline=True)
+        embed.add_field(name="🔥 Current Streak", value=f"**{streak}** weeks\n*(Use `/my_streak` for details)*", inline=True)
         embed.add_field(name="🛡️ Shield", value=f"**{row.get('streak_shields', 0)}/1**", inline=True)
         if streak_events:
             embed.add_field(name="Streak update", value=streak_event_text(streak_events), inline=False)
     embed.add_field(name="🪙 Points Earned", value=f"**+{points}**", inline=True)
     embed.add_field(name="📊 Leaderboard Rank", value=f"**#{position}**", inline=True)
     embed.add_field(name="🪙 Total Points", value=f"**{total_points}**", inline=True)
-    embed.set_footer(text="Linguazad Community", icon_url="https://i.ibb.co/BKLCTWv5/4ab2bbcfa5b9a10891406d2a84e94004.webp")
+    embed.set_footer(text="Linguazad Community • Use /my_streak to check your deadline", icon_url="https://i.ibb.co/BKLCTWv5/4ab2bbcfa5b9a10891406d2a84e94004.webp")
 
     try:
         await user.send(embed=embed)
@@ -944,6 +969,72 @@ def format_streak_fields(state):
     for field in ('streak', ANCHOR, LAST_TASK, 'streak_shields', 'streak_last_processed_period'):
         lines.append(f"{field}: {state[field]}")
     return "\n".join(lines)
+
+
+@bot.tree.command(name="my_streak", description="Check your current task streak, active week, and deadline", guild=get_guild())
+async def my_streak(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        check_date = today()
+        user_ref = db.collection(users_collection).document(str(interaction.user.id))
+        result = refresh_streak(db.transaction(), user_ref, check_date, send_reminder=False)
+        state = result['state']
+        streak = state.get('streak', 0)
+
+        embed = discord.Embed(
+            title="🔥 Task Streak Status",
+            color=0x288fcf
+        )
+        embed.set_thumbnail(url="https://i.ibb.co/BKLCTWv5/4ab2bbcfa5b9a10891406d2a84e94004.webp")
+
+        if streak == 0:
+            embed.description = "You don't have an active task streak yet! Complete any task forum activity to start a 1-week streak."
+            embed.add_field(name="🔥 Current Streak", value="**0** weeks", inline=True)
+            embed.add_field(name="🛡️ Shield", value="**0/1**", inline=True)
+        else:
+            anchor_date = read_date(state[ANCHOR])
+            last_task_date = read_date(state[LAST_TASK])
+            current_period = (check_date - anchor_date).days // 7
+            last_completed_period = (last_task_date - anchor_date).days // 7
+
+            week_start = anchor_date + timedelta(days=current_period * 7)
+            week_end = anchor_date + timedelta(days=current_period * 7 + 6)
+            start_ts = int(datetime.combine(week_start, time(0, 0, 0), tzinfo=timezone.utc).timestamp())
+            deadline_dt = datetime.combine(week_end + timedelta(days=1), time(0, 0, 0), tzinfo=timezone.utc)
+            deadline_ts = int(deadline_dt.timestamp())
+
+            embed.add_field(name="🔥 Current Streak", value=f"**{streak}** weeks", inline=True)
+            embed.add_field(name="🛡️ Shield", value=f"**{state.get('streak_shields', 0)}/1**", inline=True)
+            embed.add_field(name="📅 Current Week", value=f"<t:{start_ts}:d> – <t:{deadline_ts - 1}:d>", inline=False)
+
+            if last_completed_period == current_period:
+                embed.add_field(
+                    name="✅ Status: Completed for this week",
+                    value="You have already submitted a task for this week! Your streak is secured.",
+                    inline=False
+                )
+            else:
+                shield_text = " *(Protected by your shield if missed)*" if state.get('streak_shields', 0) == 1 else ""
+                embed.add_field(
+                    name="⏳ Status: Pending Submission",
+                    value=f"You haven't submitted a task yet this week.\n**Deadline:** <t:{deadline_ts}:R> (<t:{deadline_ts}:f>){shield_text}",
+                    inline=False
+                )
+
+        if result['events']:
+            embed.add_field(name="Streak update", value=streak_event_text(result['events']), inline=False)
+        embed.set_footer(text="Linguazad Community", icon_url="https://i.ibb.co/BKLCTWv5/4ab2bbcfa5b9a10891406d2a84e94004.webp")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"Could not retrieve streak: {e}", ephemeral=True)
+        return
+
+    if result['events']:
+        try:
+            await update_leaderboard()
+        except Exception as e:
+            # The private status already succeeded; report this separate failure to admins.
+            await log(f"Could not refresh leaderboard after /my_streak for <@{interaction.user.id}>: {e}")
 
 
 @bot.tree.command(name="streak_fields", description="Shows a member's current streak fields", guild=get_guild())

@@ -48,6 +48,14 @@ At the end of the month, the bot announces the winners. These are the prizes we 
 
 ## Commands
 
+### Member commands
+
+| Command | What it does |
+| --- | --- |
+| `/my_streak` | Shows your current task streak, shield status, active week dates, and deadline countdown. |
+
+### Admin commands
+
 These commands require Discord Administrator permission. Members earn points through their learning activities without needing to run commands.
 
 | Command | What it does |
@@ -117,3 +125,13 @@ As a server admin, use `/configure` to select the admins and channels. If you ha
 Set the optional `recommendations_channel` in `/configure` to your `recommendations` text channel (or set `recommendations_channel_id` in Firestore before starting the bot). Each post there earns 5 points and receives the existing `vip_question_emoji` reaction. The usual admin and bot exclusions apply; there is no daily limit. Admins can also select `Recommendation` in `/award_submission`.
 
 Some messages and learning activities are specific to Linguazad. You can change those in `main.py` to fit your own community.
+
+## Tests
+
+After installing the dependencies, run:
+
+```sh
+python -m unittest discover -s tests -v
+```
+
+The tests use simulated Discord and Firebase services. They do not start the bot or require credentials.
